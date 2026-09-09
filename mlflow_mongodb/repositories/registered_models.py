@@ -17,6 +17,10 @@ from mlflow_mongodb.repositories._helpers import (
     build_remove_array_element_update,
     build_replace_array_element_pipeline,
 )
+from mlflow_mongodb.repositories.errors import (
+    RegisteredModelAlreadyExistsError,
+    RegisteredModelNotFoundError,
+)
 from mlflow_mongodb.repositories.types import (
     ModelVersionRecord,
     RegisteredModelDetails,
@@ -51,14 +55,6 @@ class RegisteredModelPage:
 
     records: tuple[RegisteredModelDetails, ...]
     has_more: bool
-
-
-class RegisteredModelAlreadyExistsError(Exception):
-    """Raised when a registered model name is already stored."""
-
-
-class RegisteredModelNotFoundError(Exception):
-    """Raised when a registered model name is not stored."""
 
 
 class RegisteredModelRepository:
@@ -380,7 +376,6 @@ class RegisteredModelRepository:
             build_replace_array_element_pipeline(
                 array_field="tags",
                 key_field="key",
-                key=key,
                 element={"key": key, "value": value},
             ),
             return_document=ReturnDocument.AFTER,
@@ -444,7 +439,6 @@ class RegisteredModelRepository:
             build_replace_array_element_pipeline(
                 array_field="aliases",
                 key_field="alias",
-                key=alias,
                 element={"alias": alias, "version": version},
             ),
             return_document=ReturnDocument.AFTER,

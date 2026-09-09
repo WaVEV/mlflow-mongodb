@@ -20,6 +20,10 @@ from mlflow_mongodb.repositories._helpers import (
     build_remove_array_element_update,
     build_replace_array_element_pipeline,
 )
+from mlflow_mongodb.repositories.errors import (
+    ModelVersionAlreadyExistsError,
+    ModelVersionNotFoundError,
+)
 from mlflow_mongodb.repositories.types import (
     ModelVersionRecord,
     ModelVersionSearchResult,
@@ -59,14 +63,6 @@ class ModelVersionPage:
 
     records: tuple[ModelVersionSearchResult, ...]
     has_more: bool
-
-
-class ModelVersionAlreadyExistsError(Exception):
-    """Raised when a model version number is already stored for a registered model."""
-
-
-class ModelVersionNotFoundError(Exception):
-    """Raised when a model version is not stored for a registered model."""
 
 
 class ModelVersionRepository:
@@ -402,7 +398,6 @@ class ModelVersionRepository:
             build_replace_array_element_pipeline(
                 array_field="tags",
                 key_field="key",
-                key=key,
                 element={"key": key, "value": value},
             ),
             return_document=ReturnDocument.AFTER,

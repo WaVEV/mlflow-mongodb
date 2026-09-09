@@ -1,22 +1,52 @@
-"""MongoDB repositories used by the model registry store."""
+"""MongoDB repositories used by the tracking and model registry stores."""
 
-from mlflow_mongodb.repositories.model_versions import (
+from mlflow_mongodb.repositories.errors import (
+    ExperimentAlreadyExistsError,
+    ExperimentNotFoundError,
+    LoggedModelNotFoundError,
+    LoggedModelTagNotFoundError,
     ModelVersionAlreadyExistsError,
-    ModelVersionFilter,
     ModelVersionNotFoundError,
+    RegisteredModelAlreadyExistsError,
+    RegisteredModelNotFoundError,
+    RepositoryPersistenceError,
+    RunAlreadyExistsError,
+    RunInactiveError,
+    RunNotFoundError,
+    RunParamConflictError,
+    TraceNotFoundError,
+    TraceWriteConflictError,
+)
+from mlflow_mongodb.repositories.experiments import ExperimentRepository
+from mlflow_mongodb.repositories.logged_models import (
+    LoggedModelFilter,
+    LoggedModelOrder,
+    LoggedModelPage,
+    LoggedModelRepository,
+    LoggedModelSearchResult,
+)
+from mlflow_mongodb.repositories.model_versions import (
+    ModelVersionFilter,
     ModelVersionOrder,
     ModelVersionPage,
     ModelVersionRepository,
 )
 from mlflow_mongodb.repositories.registered_models import (
-    RegisteredModelAlreadyExistsError,
     RegisteredModelFilter,
-    RegisteredModelNotFoundError,
     RegisteredModelOrder,
     RegisteredModelPage,
     RegisteredModelRepository,
 )
+from mlflow_mongodb.repositories.runs import RunRepository
+from mlflow_mongodb.repositories.traces import TraceRepository
 from mlflow_mongodb.repositories.types import (
+    DatasetInputRecord,
+    ExperimentRecord,
+    ExperimentTagRecord,
+    LoggedModelParameterRecord,
+    LoggedModelRecord,
+    LoggedModelTagRecord,
+    ModelOutputRecord,
     ModelVersionRecord,
     ModelVersionSearchResult,
     ModelVersionTagRecord,
@@ -24,9 +54,31 @@ from mlflow_mongodb.repositories.types import (
     RegisteredModelDetails,
     RegisteredModelRecord,
     RegisteredModelTagRecord,
+    RunMetricRecord,
+    RunRecord,
+    SpanRecord,
+    SpanSummaryRecord,
+    TraceRecord,
 )
 
 __all__ = [
+    "DatasetInputRecord",
+    "ExperimentAlreadyExistsError",
+    "ExperimentNotFoundError",
+    "ExperimentRecord",
+    "ExperimentRepository",
+    "ExperimentTagRecord",
+    "LoggedModelFilter",
+    "LoggedModelNotFoundError",
+    "LoggedModelOrder",
+    "LoggedModelPage",
+    "LoggedModelParameterRecord",
+    "LoggedModelRecord",
+    "LoggedModelRepository",
+    "LoggedModelSearchResult",
+    "LoggedModelTagNotFoundError",
+    "LoggedModelTagRecord",
+    "ModelOutputRecord",
     "ModelVersionAlreadyExistsError",
     "ModelVersionFilter",
     "ModelVersionNotFoundError",
@@ -46,4 +98,18 @@ __all__ = [
     "RegisteredModelRecord",
     "RegisteredModelRepository",
     "RegisteredModelTagRecord",
+    "RepositoryPersistenceError",
+    "RunAlreadyExistsError",
+    "RunInactiveError",
+    "RunMetricRecord",
+    "RunNotFoundError",
+    "RunParamConflictError",
+    "RunRecord",
+    "RunRepository",
+    "SpanRecord",
+    "SpanSummaryRecord",
+    "TraceNotFoundError",
+    "TraceRecord",
+    "TraceRepository",
+    "TraceWriteConflictError",
 ]
