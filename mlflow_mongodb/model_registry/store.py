@@ -584,6 +584,7 @@ class MongoDBModelRegistryStore(AbstractStore):
         Returns:
             A paginated list of :py:class:`mlflow.entities.model_registry.RegisteredModel` objects.
         """
+        # OUTSIDE V1
         if max_results is None:
             max_results = SEARCH_REGISTERED_MODEL_MAX_RESULTS_DEFAULT
         if not isinstance(max_results, int) or max_results < 1:
@@ -1068,6 +1069,7 @@ class MongoDBModelRegistryStore(AbstractStore):
         Returns:
             The resolved model artifact URI.
         """
+        # OUTSIDE V1
         _validate_model_name(name)
         _validate_model_version(version)
         version = int(version)
@@ -1104,6 +1106,7 @@ class MongoDBModelRegistryStore(AbstractStore):
         Returns:
             A paginated list of :py:class:`mlflow.entities.model_registry.ModelVersion` objects.
         """
+        # OUTSIDE V1
         if max_results is None:
             max_results = SEARCH_MODEL_VERSION_MAX_RESULTS_DEFAULT
         if not isinstance(max_results, int) or max_results < 1:
