@@ -27,7 +27,7 @@ from mlflow.tracing.utils import (
 from mlflow.tracing.utils.truncation import _get_truncated_preview
 from mlflow.utils.validation import _validate_trace_tag
 
-from mlflow_mongodb.repositories.types import SpanSummaryRecord
+from mlflow_mongodb.tracking.types import SpanSummaryRecord
 
 _logger = logging.getLogger(__name__)
 _MAX_BSON_DOCUMENT_BYTES = 16 * 1024 * 1024
@@ -151,7 +151,7 @@ def span_to_document(span: Span) -> dict[str, Any]:
     except (InvalidDocument, OverflowError, ValueError, TypeError) as exc:
         raise MlflowException.invalid_parameter_value(
             f"Span '{span.span_id}' in trace '{span.trace_id}' cannot be stored as BSON."
-        ) from exc
+        ) from None
     if size > _MAX_BSON_DOCUMENT_BYTES:
         raise MlflowException.invalid_parameter_value(
             f"Span '{span.span_id}' in trace '{span.trace_id}' exceeds MongoDB's "

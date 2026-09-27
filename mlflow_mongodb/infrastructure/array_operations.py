@@ -1,33 +1,17 @@
-"""Internal helpers for repository operations."""
+"""Internal MongoDB update builders for repository documents."""
 
-from collections.abc import Callable, Mapping
-from functools import wraps
-from typing import Any, ParamSpec, TypeVar
-
-from bson.errors import BSONError
-from pymongo.errors import PyMongoError
-
-from mlflow_mongodb.repositories.errors import RepositoryPersistenceError
-
-Parameters = ParamSpec("Parameters")
-Result = TypeVar("Result")
+from collections.abc import Mapping
+from typing import Any
 
 
-def translate_database_errors(
-    function: Callable[Parameters, Result],
-) -> Callable[Parameters, Result]:
-    """Translate driver and BSON failures, preserving domain errors and the cause."""
-
-    @wraps(function)
-    def wrapper(*args: Parameters.args, **kwargs: Parameters.kwargs) -> Result:
-        try:
-            return function(*args, **kwargs)
-        except (PyMongoError, BSONError) as exc:
-            raise RepositoryPersistenceError(
-                f"Database operation '{function.__name__}' failed."
-            ) from exc
-
-    return wrapper
+def build_array_value_expression(field: str, key: str) -> dict[str, Any]:
+    """Read a value by key from an embedded ``{k, v}`` array expression."""
+    return {
+        "$getField": {
+            "field": {"$literal": key},
+            "input": {"$arrayToObject": {"$ifNull": [field, []]}},
+        }
+    }
 
 
 def build_merge_array_expression(
@@ -86,24 +70,6 @@ def build_merge_array_expression(
             },
         }
     }
-
-
-def build_merge_array_expression(
-    field: str,
-    records: list[Mapping[str, Any]],
-    identity: str,
-) -> dict[str, Any]:
-    """Build a MongoDB expression that merges embedded records by identity."""
-    incoming = {"$literal": [dict(record) for record in records]}
-    keys = {"$literal": [record[identity] for record in records]}
-    remaining_records = {
-        "$filter": {
-            "input": {"$ifNull": [field, []]},
-            "as": "stored",
-            "cond": {"$not": [{"$in": [f"$$stored.{identity}", keys]}]},
-        }
-    }
-    return {"$concatArrays": [remaining_records, incoming]}
 
 
 def build_replace_array_element_pipeline(

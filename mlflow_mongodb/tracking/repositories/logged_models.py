@@ -9,14 +9,17 @@ from typing import Any, Literal
 from pymongo import ASCENDING, DESCENDING, ReturnDocument
 from pymongo.database import Database
 
-from mlflow_mongodb.repositories._helpers import (
+from mlflow_mongodb.infrastructure.array_operations import (
     build_merge_array_expression,
     build_remove_array_element_update,
-    translate_database_errors,
 )
-from mlflow_mongodb.repositories.errors import LoggedModelNotFoundError, LoggedModelTagNotFoundError
-from mlflow_mongodb.repositories.types import LoggedModelRecord, RunMetricRecord
-from mlflow_mongodb.settings import MongoDBSettings
+from mlflow_mongodb.infrastructure.repository_operations import repository_operation
+from mlflow_mongodb.infrastructure.settings import MongoDBSettings
+from mlflow_mongodb.infrastructure.errors import (
+    RepositoryNotFoundError,
+    RepositoryTagNotFoundError,
+)
+from mlflow_mongodb.tracking.types import LoggedModelRecord, RunMetricRecord
 
 
 @dataclass(frozen=True)
@@ -59,42 +62,41 @@ class LoggedModelPage:
 class LoggedModelRepository:
     """Store logged-model metadata, tags, and parameters in one document."""
 
-    @translate_database_errors
     def __init__(self, database: Database, settings: MongoDBSettings | None = None):
         self._settings = settings or MongoDBSettings()
-        self._collection = database[self._settings.logged_models_collection_name]
-        # The model ID is the document's _id, which already has a unique index.
-        self._collection.create_index(
-            [("experiment_id", ASCENDING), ("creation_timestamp", DESCENDING), ("_id", ASCENDING)],
-            name="logged_models_experiment_creation_id",
-        )
-        for field in ("tags", "params"):
+        with repository_operation("Unable to initialize logged model repository."):
+            self._collection = database[self._settings.logged_models_collection_name]
+            # The model ID is the document's _id, which already has a unique index.
             self._collection.create_index(
-                [
-                    ("experiment_id", ASCENDING),
-                    (f"{field}.k", ASCENDING),
-                    (f"{field}.v", ASCENDING),
-                ],
-                name=f"logged_models_experiment_{field}",
+                [("experiment_id", ASCENDING), ("creation_timestamp", DESCENDING), ("_id", ASCENDING)],
+                name="logged_models_experiment_creation_id",
             )
-        self._metrics_collection = database[self._settings.run_metrics_collection_name]
-        self._metrics_collection.create_index(
-            [
-                ("model_id", ASCENDING),
-                ("k", ASCENDING),
-                ("timestamp", DESCENDING),
-                ("step", DESCENDING),
-                ("run_id", ASCENDING),
-                ("_id", ASCENDING),
-            ],
-            name="run_metrics_model_k_latest",
-        )
-        self._metrics_collection.create_index(
-            [("model_id", ASCENDING), ("dataset_name", ASCENDING), ("dataset_digest", ASCENDING)],
-            name="run_metrics_model_dataset",
-        )
+            for field in ("tags", "params"):
+                self._collection.create_index(
+                    [
+                        ("experiment_id", ASCENDING),
+                        (f"{field}.k", ASCENDING),
+                        (f"{field}.v", ASCENDING),
+                    ],
+                    name=f"logged_models_experiment_{field}",
+                )
+            self._metrics_collection = database[self._settings.run_metrics_collection_name]
+            self._metrics_collection.create_index(
+                [
+                    ("model_id", ASCENDING),
+                    ("k", ASCENDING),
+                    ("timestamp", DESCENDING),
+                    ("step", DESCENDING),
+                    ("run_id", ASCENDING),
+                    ("_id", ASCENDING),
+                ],
+                name="run_metrics_model_k_latest",
+            )
+            self._metrics_collection.create_index(
+                [("model_id", ASCENDING), ("dataset_name", ASCENDING), ("dataset_digest", ASCENDING)],
+                name="run_metrics_model_dataset",
+            )
 
-    @translate_database_errors
     def create(
         self,
         *,
@@ -125,69 +127,64 @@ class LoggedModelRepository:
             "tags": [{"k": key, "v": value} for key, value in tags.items()],
             "params": [{"k": key, "v": value} for key, value in params.items()],
         }
-        self._collection.insert_one(document)
+        with repository_operation("Unable to create logged model."):
+            self._collection.insert_one(document)
         return LoggedModelRecord.from_document(document)
 
-    @translate_database_errors
     def find_by_id(self, model_id: str) -> LoggedModelRecord | None:
-        document = self._collection.find_one({"_id": model_id})
+        with repository_operation("Unable to get logged model."):
+            document = self._collection.find_one({"_id": model_id})
         return LoggedModelRecord.from_document(document) if document is not None else None
 
-    @translate_database_errors
     def get_metric_history(self, model_id: str) -> tuple[RunMetricRecord, ...]:
         """Read the complete metric history associated with a model."""
         return self._get_metrics_by_model([model_id]).get(model_id, ())
 
-    @translate_database_errors
     def mark_deleted(self, *, model_id: str, last_updated_timestamp: int) -> None:
         """Mark a model deleted, refreshing its timestamp even when already deleted."""
-        result = self._collection.update_one(
-            {"_id": model_id},
-            {
-                "$set": {
-                    "lifecycle_stage": "deleted",
-                    "last_updated_timestamp": last_updated_timestamp,
-                }
-            },
-        )
-        # A repeated deletion in the same millisecond can match without modifying.
-        if result.matched_count == 0:
-            raise LoggedModelNotFoundError(model_id)
-
-    @translate_database_errors
-    def set_tags(self, *, model_id: str, tags: Mapping[str, str]) -> None:
-        """Merge tags and check model existence in one update, including empty batches."""
-        result = self._collection.update_one(
-            {"_id": model_id},
-            [
+        with repository_operation("Unable to delete logged model."):
+            result = self._collection.update_one(
+                {"_id": model_id},
                 {
                     "$set": {
-                        "tags": build_merge_array_expression(
-                            "$tags", [{"k": k, "v": v} for k, v in tags.items()], "k"
-                        ),
+                        "lifecycle_stage": "deleted",
+                        "last_updated_timestamp": last_updated_timestamp,
                     }
-                }
-            ],
+                },
+            )
+        # A repeated deletion in the same millisecond can match without modifying.
+        if result.matched_count == 0:
+            raise RepositoryNotFoundError(model_id)
+
+    def set_tags(self, *, model_id: str, tags: Mapping[str, str]) -> None:
+        """Merge tags and check model existence in one update, including empty batches."""
+        tags_update = build_merge_array_expression(
+            "$tags", [{"k": k, "v": v} for k, v in tags.items()], "k"
         )
+        with repository_operation("Unable to set logged model tags."):
+            result = self._collection.update_one(
+                {"_id": model_id},
+                [{"$set": {"tags": tags_update}}],
+            )
         # Empty batches and unchanged tags still match an existing model.
         if result.matched_count == 0:
-            raise LoggedModelNotFoundError(model_id)
+            raise RepositoryNotFoundError(model_id)
 
-    @translate_database_errors
     def delete_tag(self, *, model_id: str, key: str) -> None:
         """Remove a tag and distinguish a missing model from a missing tag atomically."""
-        document = self._collection.find_one_and_update(
-            {"_id": model_id},
-            build_remove_array_element_update(array_field="tags", key_field="k", key=key),
-            projection={"_id": 1, "tags.k": 1},
-            return_document=ReturnDocument.BEFORE,
-        )
+        update = build_remove_array_element_update(array_field="tags", key_field="k", key=key)
+        with repository_operation("Unable to delete logged model tag."):
+            document = self._collection.find_one_and_update(
+                {"_id": model_id},
+                update,
+                projection={"_id": 1, "tags.k": 1},
+                return_document=ReturnDocument.BEFORE,
+            )
         if document is None:
-            raise LoggedModelNotFoundError(model_id)
+            raise RepositoryNotFoundError(model_id)
         if not any(tag["k"] == key for tag in document["tags"]):
-            raise LoggedModelTagNotFoundError(key)
+            raise RepositoryTagNotFoundError(key)
 
-    @translate_database_errors
     def search(
         self,
         *,
@@ -231,7 +228,8 @@ class LoggedModelRepository:
         pipeline.extend(self._metric_stages(metric_filters, datasets, order_by))
         pipeline.extend(self._order_stages(order_by))
         pipeline.extend([{"$skip": offset}, {"$limit": max_results + 1}])
-        documents = list(self._collection.aggregate(pipeline, allowDiskUse=True))
+        with repository_operation("Unable to search logged models."):
+            documents = list(self._collection.aggregate(pipeline, allowDiskUse=True))
         page_documents = documents[:max_results]
 
         metrics_by_model = self._get_metrics_by_model(
@@ -257,30 +255,32 @@ class LoggedModelRepository:
         # each aggregation result, which would be subject to the BSON size limit.
         metrics_by_model = defaultdict(list)
         if model_ids:
-            metrics = self._metrics_collection.find(
-                {"model_id": {"$in": list(model_ids)}},
-                {
-                    "_id": 0,
-                    "model_id": 1,
-                    "run_id": 1,
-                    "k": 1,
-                    "v": 1,
-                    "timestamp": 1,
-                    "step": 1,
-                    "dataset_name": 1,
-                    "dataset_digest": 1,
-                },
-            ).sort(
-                [
-                    ("model_id", ASCENDING),
-                    ("k", ASCENDING),
-                    ("timestamp", DESCENDING),
-                    ("step", DESCENDING),
-                    ("run_id", ASCENDING),
-                    ("_id", ASCENDING),
-                ]
-            )
-            for metric in metrics:
+            with repository_operation("Unable to read logged model metric history."):
+                metrics = self._metrics_collection.find(
+                    {"model_id": {"$in": list(model_ids)}},
+                    {
+                        "_id": 0,
+                        "model_id": 1,
+                        "run_id": 1,
+                        "k": 1,
+                        "v": 1,
+                        "timestamp": 1,
+                        "step": 1,
+                        "dataset_name": 1,
+                        "dataset_digest": 1,
+                    },
+                ).sort(
+                    [
+                        ("model_id", ASCENDING),
+                        ("k", ASCENDING),
+                        ("timestamp", DESCENDING),
+                        ("step", DESCENDING),
+                        ("run_id", ASCENDING),
+                        ("_id", ASCENDING),
+                    ]
+                )
+                metric_documents = list(metrics)
+            for metric in metric_documents:
                 metrics_by_model[metric["model_id"]].append(RunMetricRecord.from_document(metric))
 
         return {model_id: tuple(metrics) for model_id, metrics in metrics_by_model.items()}

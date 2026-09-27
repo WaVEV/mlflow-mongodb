@@ -16,7 +16,7 @@ from mlflow_mongodb.infrastructure.errors import (
     RepositoryPersistenceError,
 )
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
-from mlflow_mongodb.tracking.errors import RepositoryParamConflictError
+from mlflow_mongodb.infrastructure.errors import RepositoryParamConflictError
 from mlflow_mongodb.tracking.repositories import RunRepository
 
 RUN_ID = "a" * 32
