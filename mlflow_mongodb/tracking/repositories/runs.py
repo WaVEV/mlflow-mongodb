@@ -7,15 +7,15 @@ from pymongo import ASCENDING, ReturnDocument
 from pymongo.database import Database
 from pymongo.errors import DuplicateKeyError
 
-from mlflow_mongodb.repositories._helpers import build_merge_array_expression
-from mlflow_mongodb.repositories.errors import (
+from mlflow_mongodb.infrastructure._array_updates import build_merge_array_expression
+from mlflow_mongodb.infrastructure.settings import MongoDBSettings
+from mlflow_mongodb.tracking.errors import (
     RunAlreadyExistsError,
     RunInactiveError,
     RunNotFoundError,
     RunParamConflictError,
 )
-from mlflow_mongodb.repositories.types import RunMetricRecord, RunRecord
-from mlflow_mongodb.settings import MongoDBSettings
+from mlflow_mongodb.tracking.types import RunMetricRecord, RunRecord
 
 
 class RunRepository:

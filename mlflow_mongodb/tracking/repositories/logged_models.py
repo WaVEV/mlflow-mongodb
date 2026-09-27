@@ -9,14 +9,17 @@ from typing import Any, Literal
 from pymongo import ASCENDING, DESCENDING, ReturnDocument
 from pymongo.database import Database
 
-from mlflow_mongodb.repositories._helpers import (
+from mlflow_mongodb.infrastructure._array_updates import (
     build_merge_array_expression,
     build_remove_array_element_update,
+)
+from mlflow_mongodb.infrastructure.settings import MongoDBSettings
+from mlflow_mongodb.tracking.errors import (
+    LoggedModelNotFoundError,
+    LoggedModelTagNotFoundError,
     translate_database_errors,
 )
-from mlflow_mongodb.repositories.errors import LoggedModelNotFoundError, LoggedModelTagNotFoundError
-from mlflow_mongodb.repositories.types import LoggedModelRecord, RunMetricRecord
-from mlflow_mongodb.settings import MongoDBSettings
+from mlflow_mongodb.tracking.types import LoggedModelRecord, RunMetricRecord
 
 
 @dataclass(frozen=True)

@@ -1,33 +1,17 @@
-"""Internal helpers for repository operations."""
+"""Private MongoDB array expression and update helpers shared by both stores."""
 
-from collections.abc import Callable, Mapping
-from functools import wraps
-from typing import Any, ParamSpec, TypeVar
-
-from bson.errors import BSONError
-from pymongo.errors import PyMongoError
-
-from mlflow_mongodb.repositories.errors import RepositoryPersistenceError
-
-Parameters = ParamSpec("Parameters")
-Result = TypeVar("Result")
+from collections.abc import Mapping
+from typing import Any
 
 
-def translate_database_errors(
-    function: Callable[Parameters, Result],
-) -> Callable[Parameters, Result]:
-    """Translate driver and BSON failures, preserving domain errors and the cause."""
-
-    @wraps(function)
-    def wrapper(*args: Parameters.args, **kwargs: Parameters.kwargs) -> Result:
-        try:
-            return function(*args, **kwargs)
-        except (PyMongoError, BSONError) as exc:
-            raise RepositoryPersistenceError(
-                f"Database operation '{function.__name__}' failed."
-            ) from exc
-
-    return wrapper
+def build_array_value_expression(field: str, key: str) -> dict[str, Any]:
+    """Read a value by key from an embedded ``{k, v}`` array expression."""
+    return {
+        "$getField": {
+            "field": {"$literal": key},
+            "input": {"$arrayToObject": {"$ifNull": [field, []]}},
+        }
+    }
 
 
 def build_merge_array_expression(

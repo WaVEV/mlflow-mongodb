@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 from collections import defaultdict
 from functools import cached_property
 from typing import Any
@@ -59,9 +60,11 @@ from mlflow.store.entities.paged_list import PagedList
 from mlflow.store.tracking import (
     MAX_RESULTS_QUERY_TRACE_METRICS,
     SEARCH_LOGGED_MODEL_MAX_RESULTS_DEFAULT,
+    SEARCH_MAX_RESULTS_DEFAULT,
+    SEARCH_MAX_RESULTS_THRESHOLD,
+    SEARCH_TRACES_DEFAULT_MAX_RESULTS,
 )
 from mlflow.store.tracking.abstract_store import AbstractStore
-from mlflow.store.tracking.utils.sql_trace_metrics_utils import validate_query_trace_metrics_params
 from mlflow.tracing.constant import (
     SpansLocation,
     TraceMetadataKey,
@@ -70,10 +73,16 @@ from mlflow.tracing.constant import (
 )
 from mlflow.utils.mlflow_tags import MLFLOW_RUN_NAME, _get_run_name_from_tags
 from mlflow.utils.name_utils import _generate_random_name
-from mlflow.utils.search_utils import SearchLoggedModelsPaginationToken, SearchUtils
+from mlflow.utils.search_utils import (
+    SearchExperimentsUtils,
+    SearchLoggedModelsPaginationToken,
+    SearchTraceUtils,
+    SearchUtils,
+)
 from mlflow.utils.time import get_current_time_millis
 from mlflow.utils.uri import append_to_uri_path, resolve_uri_if_local
 from mlflow.utils.validation import (
+    _resolve_experiment_ids_and_locations,
     _validate_batch_log_data,
     _validate_batch_log_limits,
     _validate_dataset_inputs,
@@ -91,36 +100,51 @@ from pymongo import MongoClient
 from pymongo.database import Database
 from pymongo.errors import ConfigurationError, PyMongoError
 
-from mlflow_mongodb.logged_model_search import (
+from mlflow_mongodb.infrastructure.settings import MongoDBSettings
+from mlflow_mongodb.tracking._retry import retry_on_exception
+from mlflow_mongodb.tracking.errors import (
+    ExperimentAlreadyExistsError,
+    ExperimentNotFoundError,
+    LoggedModelNotFoundError,
+    LoggedModelTagNotFoundError,
+    RepositoryPersistenceError,
+    RunAlreadyExistsError,
+    RunInactiveError,
+    RunNotFoundError,
+    RunParamConflictError,
+    TraceNotFoundError,
+    TraceWriteConflictError,
+)
+from mlflow_mongodb.tracking.logged_model_search import (
     parse_logged_model_filters,
     parse_logged_model_order,
     parse_logged_model_page_token,
     validate_logged_model_datasets,
 )
-from mlflow_mongodb.repositories import (
-    ExperimentAlreadyExistsError,
-    ExperimentNotFoundError,
+from mlflow_mongodb.tracking.repositories import (
     ExperimentRepository,
-    LoggedModelNotFoundError,
-    LoggedModelRecord,
     LoggedModelRepository,
-    LoggedModelTagNotFoundError,
-    RepositoryPersistenceError,
-    RunAlreadyExistsError,
-    RunInactiveError,
-    RunMetricRecord,
-    RunNotFoundError,
-    RunParamConflictError,
     RunRepository,
-    SpanRecord,
-    TraceNotFoundError,
-    TraceRecord,
-    TraceRepository,
-    TraceWriteConflictError,
 )
-from mlflow_mongodb.retry import retry_on_exception
-from mlflow_mongodb.settings import MongoDBSettings
-from mlflow_mongodb.trace_utils import numeric_stats, span_to_document, summarize_spans
+from mlflow_mongodb.tracking.repositories.experiments import ExperimentFilter, ExperimentOrder
+from mlflow_mongodb.tracking.repositories.traces import (
+    TraceRepository,
+    TraceSearchFilter,
+    TraceSearchOrder,
+)
+from mlflow_mongodb.tracking.trace_utils import numeric_stats, span_to_document, summarize_spans
+from mlflow_mongodb.tracking.types import (
+    LoggedModelRecord,
+    RunMetricRecord,
+    SpanRecord,
+    TraceRecord,
+)
+
+try:
+    from mlflow.utils.search_utils import SearchEvaluationDatasetsUtils
+except ImportError:
+    # MLflow 3.1 has no evaluation-dataset search API or parser.
+    SearchEvaluationDatasetsUtils = None
 
 logger = logging.getLogger(__name__)
 
@@ -189,12 +213,99 @@ class MongoDBTrackingStore(AbstractStore):
     def search_experiments(
         self,
         view_type: ViewType = ViewType.ACTIVE_ONLY,
-        max_results: int = 1000,
+        max_results: int = SEARCH_MAX_RESULTS_DEFAULT,
         filter_string: str | None = None,
         order_by: list[str] | None = None,
         page_token: str | None = None,
     ) -> PagedList[Experiment]:
-        raise NotImplementedError
+        if isinstance(max_results, bool) or not isinstance(max_results, int) or max_results < 1:
+            raise MlflowException(
+                f"Invalid value {max_results} for parameter 'max_results' supplied. It must be "
+                "a positive integer",
+                INVALID_PARAMETER_VALUE,
+            )
+        if max_results > SEARCH_MAX_RESULTS_THRESHOLD:
+            raise MlflowException(
+                f"Invalid value {max_results} for parameter 'max_results' supplied. It must be "
+                f"at most {SEARCH_MAX_RESULTS_THRESHOLD}",
+                INVALID_PARAMETER_VALUE,
+            )
+
+        filters = self._parse_experiment_filters(filter_string)
+        orders = self._parse_experiment_order(order_by)
+        offset = SearchUtils.parse_start_offset_from_page_token(page_token)
+        if offset < 0:
+            raise MlflowException("Page offset must not be negative.", INVALID_PARAMETER_VALUE)
+        try:
+            records = self._experiment_repository.search(
+                lifecycle_stages=LifecycleStage.view_type_to_stages(view_type),
+                filters=filters,
+                order_by=orders,
+                offset=offset,
+                limit=max_results + 1,
+            )
+        except RepositoryPersistenceError:
+            logger.exception("Unable to search experiments")
+            raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
+        except (PyMongoError, BSONError):
+            # Repository construction creates indexes before the decorated query method runs.
+            logger.exception("Unable to initialize experiment search")
+            raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
+
+        next_page_token = None
+        if len(records) > max_results:
+            records = records[:max_results]
+            next_page_token = SearchUtils.create_page_token(offset + max_results)
+        experiments = [
+            Experiment(
+                experiment_id=record.experiment_id,
+                name=record.name,
+                artifact_location=record.artifact_location,
+                lifecycle_stage=record.lifecycle_stage,
+                tags=[ExperimentTag(tag.key, tag.value) for tag in record.tags],
+                creation_time=record.creation_time,
+                last_update_time=record.last_update_time,
+            )
+            for record in records
+        ]
+        return PagedList(experiments, next_page_token)
+
+    @staticmethod
+    def _parse_experiment_filters(filter_string: str | None) -> tuple[ExperimentFilter, ...]:
+        filters = []
+        for parsed in SearchExperimentsUtils.parse_search_filter(filter_string):
+            field_type = parsed["type"]
+            key = parsed["key"]
+            comparator = parsed["comparator"].upper()
+            value = parsed["value"]
+
+            if SearchExperimentsUtils.is_numeric_attribute(field_type, key, comparator):
+                # MLflow returns numeric tokens as text; BSON comparisons need numbers.
+                value = float(value)
+            elif not (
+                SearchExperimentsUtils.is_string_attribute(field_type, key, comparator)
+                or SearchExperimentsUtils.is_tag(field_type, comparator)
+            ):
+                raise MlflowException.invalid_parameter_value(f"Invalid token type: {field_type}")
+
+            filters.append(ExperimentFilter(field_type, key, comparator, value))
+        return tuple(filters)
+
+    @staticmethod
+    def _parse_experiment_order(order_by: list[str] | None) -> tuple[ExperimentOrder, ...]:
+        orders = []
+        for field_type, key, ascending in map(
+            SearchExperimentsUtils.parse_order_by_for_search_experiments,
+            order_by or ["creation_time DESC", "experiment_id ASC"],
+        ):
+            if field_type != "attribute":
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid order_by entity: {field_type}"
+                )
+            orders.append(ExperimentOrder(key, ascending))
+        if not any(order.key == "experiment_id" for order in orders):
+            orders.append(ExperimentOrder("experiment_id", False))
+        return tuple(orders)
 
     def create_experiment(
         self,
@@ -1046,13 +1157,110 @@ class MongoDBTrackingStore(AbstractStore):
         self,
         experiment_ids: list[str] | None = None,
         filter_string: str | None = None,
-        max_results: int = 1000,
+        max_results: int = SEARCH_TRACES_DEFAULT_MAX_RESULTS,
         order_by: list[str] | None = None,
         page_token: str | None = None,
-        model_id: str | None = None,
+        model_id: str | None = None,  # ruff: ignore[unused-method-argument]
         locations: list[str] | None = None,
     ) -> tuple[list[TraceInfo], str | None]:
-        raise NotImplementedError
+        locations = _resolve_experiment_ids_and_locations(experiment_ids, locations)
+        if (
+            isinstance(max_results, bool)
+            or not isinstance(max_results, int)
+            or max_results < 1
+            or max_results > SEARCH_MAX_RESULTS_THRESHOLD
+        ):
+            raise MlflowException(
+                f"Invalid value {max_results} for parameter 'max_results' supplied. It must be "
+                f"a positive integer at most {SEARCH_MAX_RESULTS_THRESHOLD}",
+                INVALID_PARAMETER_VALUE,
+            )
+        filters = []
+        for clause in SearchTraceUtils.parse_search_filter_for_search_traces(filter_string):
+            field_type = clause["type"]
+            if field_type in ("span", "feedback", "expectation", "issue"):
+                continue
+            key = clause["key"]
+            operator = clause["comparator"].upper()
+            value = clause["value"]
+            if SearchTraceUtils.is_attribute(field_type, key, operator):
+                pass
+            elif SearchTraceUtils.is_tag(field_type, operator):
+                if key == TraceTagKey.LINKED_PROMPTS and (operator != "=" or value.count("/") != 1):
+                    raise MlflowException.invalid_parameter_value(
+                        'Prompt filters require `prompt = "name/version"`.'
+                    )
+            elif SearchTraceUtils.is_request_metadata(field_type, operator):
+                if key in (
+                    TraceMetadataKey.TOKEN_USAGE,
+                    TraceMetadataKey.COST,
+                ) and operator not in ("=", "!=", "IS NULL", "IS NOT NULL"):
+                    raise MlflowException.invalid_parameter_value(
+                        f"Comparator '{operator}' is not supported for reserved metadata '{key}'. "
+                        "Only '=', '!=', 'IS NULL', and 'IS NOT NULL' are supported."
+                    )
+            else:
+                raise MlflowException(
+                    f"Invalid trace search field type: {field_type}",
+                    INVALID_PARAMETER_VALUE,
+                )
+            if operator == "RLIKE":
+                try:
+                    re.compile(value)
+                except re.error:
+                    raise MlflowException.invalid_parameter_value(
+                        "Invalid regular expression in trace filter."
+                    ) from None
+            filters.append(TraceSearchFilter(field_type, key, operator, value))
+
+        orders = []
+        seen_order_fields = set()
+        for clause in order_by or []:
+            field_type, key, ascending = SearchTraceUtils.parse_order_by_for_search_traces(clause)
+            if field_type == "attribute":
+                SearchTraceUtils.is_attribute(field_type, key, "=")
+            elif field_type == "tag":
+                SearchTraceUtils.is_tag(field_type, "=")
+            elif field_type == "request_metadata":
+                SearchTraceUtils.is_request_metadata(field_type, "=")
+            else:
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid trace ordering field: {field_type}"
+                )
+            if field_type == "request_metadata" and key in (
+                TraceMetadataKey.TOKEN_USAGE,
+                TraceMetadataKey.COST,
+            ):
+                raise MlflowException.invalid_parameter_value(
+                    f"Ordering by reserved metadata '{key}' is not supported."
+                )
+            if (field_type, key) in seen_order_fields:
+                raise MlflowException.invalid_parameter_value(
+                    f"`order_by` contains duplicate fields: {order_by}"
+                )
+            seen_order_fields.add((field_type, key))
+            orders.append(TraceSearchOrder(field_type, key, ascending))
+        if 2 * len(orders) + 2 > 32:
+            raise MlflowException.invalid_parameter_value("Too many trace ordering fields.")
+        offset = SearchTraceUtils.parse_start_offset_from_page_token(page_token)
+        if offset < 0:
+            raise MlflowException("Page offset must not be negative.", INVALID_PARAMETER_VALUE)
+        try:
+            records = self._trace_repository.search_trace_infos(
+                experiment_ids=locations,
+                filters=filters,
+                order_by=orders,
+                offset=offset,
+                limit=max_results,
+            )
+        except RepositoryPersistenceError:
+            logger.exception("Unable to search traces")
+            raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
+
+        next_token = None
+        if len(records) == max_results:
+            next_token = SearchTraceUtils.create_page_token(offset + max_results)
+        return [self._to_trace_info(record) for record in records], next_token
 
     def get_assessment(self, trace_id: str, assessment_id: str) -> Assessment:
         raise NotImplementedError
@@ -1089,6 +1297,11 @@ class MongoDBTrackingStore(AbstractStore):
         max_results: int = MAX_RESULTS_QUERY_TRACE_METRICS,
         page_token: str | None = None,  # ruff: ignore[unused-method-argument]
     ) -> PagedList[MetricDataPoint]:
+        # Its SQL models import MLflow clients, which are unavailable during discovery.
+        from mlflow.store.tracking.utils.sql_trace_metrics_utils import (  # ruff: ignore[import-outside-top-level]
+            validate_query_trace_metrics_params,
+        )
+
         validate_query_trace_metrics_params(view_type, metric_name, aggregations, dimensions)
         if time_interval_seconds and (start_time_ms is None or end_time_ms is None):
             raise MlflowException.invalid_parameter_value(
@@ -1270,6 +1483,62 @@ class MongoDBTrackingStore(AbstractStore):
             [self._to_logged_model(result.model, result.metrics) for result in page.records],
             next_token,
         )
+
+    def search_datasets(
+        self,
+        experiment_ids: list[str] | None = None,  # ruff: ignore[unused-method-argument]
+        filter_string: str | None = None,
+        max_results: int = 1000,
+        order_by: list[str] | None = None,
+        page_token: str | None = None,
+    ) -> PagedList:
+        """Return an empty evaluation-dataset page until dataset storage is implemented."""
+        if SearchEvaluationDatasetsUtils is None:
+            raise MlflowException.invalid_parameter_value(
+                "Evaluation dataset search is unavailable in this MLflow version."
+            )
+
+        if (
+            isinstance(max_results, bool)
+            or not isinstance(max_results, int)
+            or max_results < 1
+            or max_results > SEARCH_MAX_RESULTS_THRESHOLD
+        ):
+            raise MlflowException.invalid_parameter_value(
+                f"`max_results` must be a positive integer at most {SEARCH_MAX_RESULTS_THRESHOLD}."
+            )
+
+        for clause in SearchEvaluationDatasetsUtils.parse_search_filter(filter_string):
+            key_type = clause["type"]
+            comparator = clause["comparator"]
+            if (
+                key_type == "attribute"
+                and clause["key"] in SearchEvaluationDatasetsUtils.NUMERIC_ATTRIBUTES
+            ):
+                valid_comparators = (
+                    SearchEvaluationDatasetsUtils.VALID_NUMERIC_ATTRIBUTE_COMPARATORS
+                )
+            else:
+                valid_comparators = SearchEvaluationDatasetsUtils.VALID_TAG_COMPARATORS
+            if comparator not in valid_comparators:
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid comparator for evaluation dataset {key_type}: {comparator}"
+                )
+
+        for clause in order_by or []:
+            key_type, _, _ = (
+                SearchEvaluationDatasetsUtils.parse_order_by_for_search_evaluation_datasets(clause)
+            )
+            if key_type != "attribute":
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid order_by entity: {key_type}"
+                )
+        offset = SearchUtils.parse_start_offset_from_page_token(page_token)
+        if offset < 0:
+            raise MlflowException.invalid_parameter_value("Page offset must not be negative.")
+
+        # No evaluation-dataset records can be created by this store yet.
+        return PagedList([], None)
 
     def get_logged_model(self, model_id: str, allow_deleted: bool = False) -> LoggedModel:
         """Fetch model metadata and its complete associated metric history."""

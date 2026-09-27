@@ -5,10 +5,9 @@ import math
 from typing import Any
 
 from mlflow.exceptions import MlflowException
-from mlflow.utils.search_logged_model_utils import parse_filter_string
 from mlflow.utils.search_utils import SearchLoggedModelsPaginationToken
 
-from mlflow_mongodb.repositories.logged_models import LoggedModelFilter, LoggedModelOrder
+from mlflow_mongodb.tracking.repositories.logged_models import LoggedModelFilter, LoggedModelOrder
 
 _ATTRIBUTE_ALIASES = {
     "creation_time": "creation_timestamp",
@@ -58,6 +57,11 @@ def validate_logged_model_datasets(datasets: list[dict[str, Any]] | None) -> Non
 
 
 def parse_logged_model_filters(filter_string: str | None) -> tuple[LoggedModelFilter, ...]:
+    # The parser imports SQL models; defer it until MLflow finishes store discovery.
+    from mlflow.utils.search_logged_model_utils import (  # ruff: ignore[import-outside-top-level]
+        parse_filter_string,
+    )
+
     if filter_string is not None and not isinstance(filter_string, str):
         raise MlflowException.invalid_parameter_value("`filter_string` must be a string.")
     try:
