@@ -38,7 +38,6 @@ from mlflow_mongodb.repositories.registered_models import (
     RegisteredModelRepository,
 )
 from mlflow_mongodb.repositories.runs import RunRepository
-from mlflow_mongodb.repositories.traces import TraceRepository
 from mlflow_mongodb.repositories.types import (
     DatasetInputRecord,
     ExperimentRecord,
@@ -110,6 +109,5 @@ __all__ = [
     "SpanSummaryRecord",
     "TraceNotFoundError",
     "TraceRecord",
-    "TraceRepository",
     "TraceWriteConflictError",
 ]

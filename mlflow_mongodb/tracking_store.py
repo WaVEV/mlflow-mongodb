@@ -115,9 +115,9 @@ from mlflow_mongodb.repositories import (
     SpanRecord,
     TraceNotFoundError,
     TraceRecord,
-    TraceRepository,
     TraceWriteConflictError,
 )
+from mlflow_mongodb.repositories.traces import TraceRepository
 from mlflow_mongodb.retry import retry_on_exception
 from mlflow_mongodb.settings import MongoDBSettings
 from mlflow_mongodb.trace_utils import numeric_stats, span_to_document, summarize_spans
