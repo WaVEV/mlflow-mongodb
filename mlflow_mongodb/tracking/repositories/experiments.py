@@ -54,6 +54,7 @@ class ExperimentRepository:
                 [("lifecycle_stage", ASCENDING), ("creation_time", DESCENDING), ("_id", ASCENDING)],
                 name="experiments_lifecycle_creation_id",
             )
+        # TODO: Check if create index can raise BSONError.
         except (PyMongoError, BSONError) as exc:
             raise RepositoryPersistenceError("A database operation failed.") from exc
 
@@ -139,6 +140,7 @@ class ExperimentRepository:
             self._collection.insert_one(document)
         except DuplicateKeyError as exc:
             # Do not report an ID collision as a duplicate experiment name.
+
             if exc.details and exc.details.get("keyPattern") == {"_id": 1}:
                 raise RepositoryPersistenceError("Unable to create experiment.") from exc
             raise RepositoryAlreadyExistsError(name) from exc
