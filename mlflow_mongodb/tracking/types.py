@@ -35,6 +35,6 @@ class ExperimentRecord:
             creation_time=document["creation_time"],
             last_update_time=document["last_update_time"],
             tags=tuple(
-                ExperimentTagRecord(tag["key"], tag["value"]) for tag in document.get("tags", [])
+                ExperimentTagRecord(tag["k"], tag["v"]) for tag in document.get("tags", [])
             ),
         )

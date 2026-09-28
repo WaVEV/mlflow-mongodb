@@ -43,7 +43,7 @@ class ExperimentRepository:
             "lifecycle_stage": lifecycle_stage,
             "creation_time": creation_timestamp,
             "last_update_time": creation_timestamp,
-            "tags": [{"key": key, "value": value} for key, value in tags.items()],
+            "tags": [{"k": key, "v": value} for key, value in tags.items()],
         }
         try:
             self._collection.insert_one(document)
