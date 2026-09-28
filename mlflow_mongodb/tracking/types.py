@@ -34,7 +34,5 @@ class ExperimentRecord:
             lifecycle_stage=document["lifecycle_stage"],
             creation_time=document["creation_time"],
             last_update_time=document["last_update_time"],
-            tags=tuple(
-                ExperimentTagRecord(tag["k"], tag["v"]) for tag in document.get("tags", [])
-            ),
+            tags=tuple(ExperimentTagRecord(tag["k"], tag["v"]) for tag in document.get("tags", [])),
         )
