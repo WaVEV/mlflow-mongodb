@@ -7,3 +7,7 @@ class ExperimentAlreadyExistsError(Exception):
 
 class ExperimentNotFoundError(Exception):
     """Raised when an experiment is not stored in the expected lifecycle stage."""
+
+
+class ExperimentNotActiveError(Exception):
+    """Raised when a rename targets a non-active experiment."""
