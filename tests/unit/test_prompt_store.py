@@ -4,7 +4,7 @@ import pytest
 from mlflow.exceptions import MlflowException
 from mlflow.prompt.constants import IS_PROMPT_TAG_KEY, PROMPT_TEXT_TAG_KEY
 
-from mlflow_mongodb.repositories import (
+from mlflow_mongodb.model_registry.errors import (
     RegisteredModelAlreadyExistsError,
     RegisteredModelNotFoundError,
 )

@@ -16,16 +16,20 @@ from pymongo import ASCENDING, DESCENDING, ReturnDocument
 from pymongo.database import Database
 from pymongo.errors import DuplicateKeyError
 
-from mlflow_mongodb.repositories._helpers import (
+from mlflow_mongodb.infrastructure._array_updates import (
     build_remove_array_element_update,
     build_replace_array_element_pipeline,
 )
-from mlflow_mongodb.repositories.types import (
+from mlflow_mongodb.infrastructure.settings import MongoDBSettings
+from mlflow_mongodb.model_registry.errors import (
+    ModelVersionAlreadyExistsError,
+    ModelVersionNotFoundError,
+)
+from mlflow_mongodb.model_registry.types import (
     ModelVersionRecord,
     ModelVersionSearchResult,
     RegisteredModelRecord,
 )
-from mlflow_mongodb.settings import MongoDBSettings
 
 logger = logging.getLogger(__name__)
 
@@ -59,14 +63,6 @@ class ModelVersionPage:
 
     records: tuple[ModelVersionSearchResult, ...]
     has_more: bool
-
-
-class ModelVersionAlreadyExistsError(Exception):
-    """Raised when a model version number is already stored for a registered model."""
-
-
-class ModelVersionNotFoundError(Exception):
-    """Raised when a model version is not stored for a registered model."""
 
 
 class ModelVersionRepository:

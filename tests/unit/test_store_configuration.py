@@ -6,7 +6,7 @@ import pytest
 from mlflow.exceptions import MlflowException
 
 from mlflow_mongodb import MongoDBModelRegistryStore
-from mlflow_mongodb.settings import MongoDBSettings
+from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 
 
 def test_mongo_client_requires_registry_uri():

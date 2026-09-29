@@ -15,7 +15,7 @@ from mlflow.protos.databricks_pb2 import (
 )
 
 from mlflow_mongodb import MongoDBModelRegistryStore
-from mlflow_mongodb.repositories import (
+from mlflow_mongodb.model_registry.errors import (
     ModelVersionAlreadyExistsError,
     ModelVersionNotFoundError,
     RegisteredModelAlreadyExistsError,
@@ -33,7 +33,7 @@ def test_tracking_client_is_lazy_and_cached(monkeypatch):
     tracking_client = Mock()
     client_factory = Mock(return_value=tracking_client)
     monkeypatch.setattr(
-        "mlflow_mongodb.model_registry_store.MlflowClient",
+        "mlflow_mongodb.model_registry.store.MlflowClient",
         client_factory,
     )
 

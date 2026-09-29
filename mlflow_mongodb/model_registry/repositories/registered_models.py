@@ -13,16 +13,20 @@ from pymongo import ASCENDING, DESCENDING, ReturnDocument
 from pymongo.database import Database
 from pymongo.errors import DuplicateKeyError
 
-from mlflow_mongodb.repositories._helpers import (
+from mlflow_mongodb.infrastructure._array_updates import (
     build_remove_array_element_update,
     build_replace_array_element_pipeline,
 )
-from mlflow_mongodb.repositories.types import (
+from mlflow_mongodb.infrastructure.settings import MongoDBSettings
+from mlflow_mongodb.model_registry.errors import (
+    RegisteredModelAlreadyExistsError,
+    RegisteredModelNotFoundError,
+)
+from mlflow_mongodb.model_registry.types import (
     ModelVersionRecord,
     RegisteredModelDetails,
     RegisteredModelRecord,
 )
-from mlflow_mongodb.settings import MongoDBSettings
 
 logger = logging.getLogger(__name__)
 
@@ -51,14 +55,6 @@ class RegisteredModelPage:
 
     records: tuple[RegisteredModelDetails, ...]
     has_more: bool
-
-
-class RegisteredModelAlreadyExistsError(Exception):
-    """Raised when a registered model name is already stored."""
-
-
-class RegisteredModelNotFoundError(Exception):
-    """Raised when a registered model name is not stored."""
 
 
 class RegisteredModelRepository:

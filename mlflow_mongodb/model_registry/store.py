@@ -54,22 +54,26 @@ from mlflow.utils.validation import (
 from pymongo import MongoClient
 from pymongo.errors import ConfigurationError
 
-from mlflow_mongodb.repositories import (
+from mlflow_mongodb.infrastructure.settings import MongoDBSettings
+from mlflow_mongodb.model_registry.errors import (
     ModelVersionAlreadyExistsError,
-    ModelVersionFilter,
     ModelVersionNotFoundError,
-    ModelVersionOrder,
-    ModelVersionRecord,
-    ModelVersionRepository,
     RegisteredModelAlreadyExistsError,
-    RegisteredModelDetails,
-    RegisteredModelFilter,
     RegisteredModelNotFoundError,
+)
+from mlflow_mongodb.model_registry.repositories import (
+    ModelVersionFilter,
+    ModelVersionOrder,
+    ModelVersionRepository,
+    RegisteredModelFilter,
     RegisteredModelOrder,
-    RegisteredModelRecord,
     RegisteredModelRepository,
 )
-from mlflow_mongodb.settings import MongoDBSettings
+from mlflow_mongodb.model_registry.types import (
+    ModelVersionRecord,
+    RegisteredModelDetails,
+    RegisteredModelRecord,
+)
 
 logger = logging.getLogger(__name__)
 

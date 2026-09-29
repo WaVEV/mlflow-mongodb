@@ -10,14 +10,16 @@ from mlflow.entities.model_registry.model_version_status import ModelVersionStat
 from mlflow.tracking.client import MlflowClient
 
 from mlflow_mongodb import MongoDBModelRegistryStore
-from mlflow_mongodb.repositories import (
-    ModelVersionRecord,
+from mlflow_mongodb.model_registry.repositories import (
     ModelVersionRepository,
+    RegisteredModelRepository,
+)
+from mlflow_mongodb.model_registry.types import (
+    ModelVersionRecord,
     ModelVersionTagRecord,
     RegisteredModelAliasRecord,
     RegisteredModelDetails,
     RegisteredModelRecord,
-    RegisteredModelRepository,
     RegisteredModelTagRecord,
 )
 
@@ -48,7 +50,7 @@ def tracking_client():
 def store(monkeypatch, registered_model_repository, model_version_repository, tracking_client):
     """Return a store wired to mocks so unit tests never connect to MongoDB."""
     monkeypatch.setattr(
-        "mlflow_mongodb.model_registry_store.get_current_time_millis",
+        "mlflow_mongodb.model_registry.store.get_current_time_millis",
         lambda: FIXED_TIMESTAMP,
     )
 
