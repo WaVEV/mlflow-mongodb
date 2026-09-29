@@ -1,7 +1,7 @@
 """Functional assertions for production MongoDB index definitions."""
 
 from mlflow_mongodb import MongoDBModelRegistryStore
-from mlflow_mongodb.repositories import (
+from mlflow_mongodb.model_registry.repositories import (
     ModelVersionRepository,
     RegisteredModelRepository,
 )

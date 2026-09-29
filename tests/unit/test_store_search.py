@@ -7,7 +7,7 @@ from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE, ErrorCode
 from mlflow.utils.search_utils import SearchModelUtils, SearchModelVersionUtils, SearchUtils
 
 from mlflow_mongodb import MongoDBModelRegistryStore
-from mlflow_mongodb.repositories import (
+from mlflow_mongodb.model_registry.repositories import (
     ModelVersionFilter,
     ModelVersionOrder,
     RegisteredModelFilter,

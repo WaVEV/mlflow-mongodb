@@ -20,7 +20,7 @@ def test_model_version_create_update_and_stage_validation_contract(
     name = "model-version-metadata-contract"
     clock = {"now": 1_700_001_000_000}
     monkeypatch.setattr(
-        "mlflow_mongodb.model_registry_store.get_current_time_millis",
+        "mlflow_mongodb.model_registry.store.get_current_time_millis",
         lambda: clock["now"],
     )
     store.create_registered_model(name)
@@ -129,7 +129,7 @@ def test_transition_with_archiving_rejects_inactive_stages_and_archives_peers(
 
     transition_timestamp = 1_700_002_000_000
     monkeypatch.setattr(
-        "mlflow_mongodb.model_registry_store.get_current_time_millis",
+        "mlflow_mongodb.model_registry.store.get_current_time_millis",
         lambda: transition_timestamp,
     )
     store.transition_model_version_stage(name, version_three.version, "STAGING", True)

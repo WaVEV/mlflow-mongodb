@@ -113,7 +113,7 @@ def test_search_model_versions_orders_and_paginates_stably(
 ):
     clock = {"now": 1_700_003_000_000}
     monkeypatch.setattr(
-        "mlflow_mongodb.model_registry_store.get_current_time_millis",
+        "mlflow_mongodb.model_registry.store.get_current_time_millis",
         lambda: clock["now"],
     )
     names = [
@@ -294,7 +294,7 @@ def test_search_registered_models_orders_and_paginates_stably(
 ):
     clock = {"now": 1_700_004_000_000}
     monkeypatch.setattr(
-        "mlflow_mongodb.model_registry_store.get_current_time_millis",
+        "mlflow_mongodb.model_registry.store.get_current_time_millis",
         lambda: clock["now"],
     )
 

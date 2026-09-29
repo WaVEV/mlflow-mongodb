@@ -32,8 +32,8 @@ setup(
     },
     entry_points={
         "mlflow.model_registry_store": [
-            "mongodb=mlflow_mongodb.model_registry_store:MongoDBModelRegistryStore",
-            "mongodb+srv=mlflow_mongodb.model_registry_store:MongoDBModelRegistryStore",
+            "mongodb=mlflow_mongodb.model_registry.store:MongoDBModelRegistryStore",
+            "mongodb+srv=mlflow_mongodb.model_registry.store:MongoDBModelRegistryStore",
         ],
     },
     classifiers=[

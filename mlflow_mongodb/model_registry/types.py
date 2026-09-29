@@ -1,4 +1,4 @@
-"""Shared persistence DTOs for the MongoDB repositories."""
+"""Persistence DTOs owned by the model-registry store."""
 
 from collections.abc import Mapping
 from dataclasses import dataclass

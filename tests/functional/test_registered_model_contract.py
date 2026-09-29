@@ -23,7 +23,7 @@ def test_registered_model_create_get_and_update_contract(
 ):
     clock = {"now": 1_700_000_000_000}
     monkeypatch.setattr(
-        "mlflow_mongodb.model_registry_store.get_current_time_millis",
+        "mlflow_mongodb.model_registry.store.get_current_time_millis",
         lambda: clock["now"],
     )
 
@@ -93,7 +93,7 @@ def test_rename_registered_model_preserves_versions_and_rejects_conflicts(
 
     rename_timestamp = 1_700_000_100_000
     monkeypatch.setattr(
-        "mlflow_mongodb.model_registry_store.get_current_time_millis",
+        "mlflow_mongodb.model_registry.store.get_current_time_millis",
         lambda: rename_timestamp,
     )
 
