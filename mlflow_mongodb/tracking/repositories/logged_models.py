@@ -68,7 +68,11 @@ class LoggedModelRepository:
             self._collection = database[self._settings.logged_models_collection_name]
             # The model ID is the document's _id, which already has a unique index.
             self._collection.create_index(
-                [("experiment_id", ASCENDING), ("creation_timestamp", DESCENDING), ("_id", ASCENDING)],
+                [
+                    ("experiment_id", ASCENDING),
+                    ("creation_timestamp", DESCENDING),
+                    ("_id", ASCENDING),
+                ],
                 name="logged_models_experiment_creation_id",
             )
             for field in ("tags", "params"):
@@ -93,7 +97,11 @@ class LoggedModelRepository:
                 name="run_metrics_model_k_latest",
             )
             self._metrics_collection.create_index(
-                [("model_id", ASCENDING), ("dataset_name", ASCENDING), ("dataset_digest", ASCENDING)],
+                [
+                    ("model_id", ASCENDING),
+                    ("dataset_name", ASCENDING),
+                    ("dataset_digest", ASCENDING),
+                ],
                 name="run_metrics_model_dataset",
             )
 

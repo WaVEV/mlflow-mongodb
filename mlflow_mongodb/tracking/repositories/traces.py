@@ -8,6 +8,7 @@ from itertools import islice
 from types import MappingProxyType
 from typing import Any, ClassVar, Final
 
+from bson.errors import BSONError
 from mlflow.entities.trace_metrics import (
     AggregationType,
     MetricAggregation,
@@ -34,7 +35,11 @@ from mlflow.tracing.constant import (
 from mlflow.utils.search_utils import SearchTraceMetricsUtils, SearchUtils
 from pymongo import ASCENDING, DESCENDING, ReplaceOne, ReturnDocument, UpdateOne
 from pymongo.database import Database
-from pymongo.errors import DuplicateKeyError
+
+from pymongo.errors import (
+    DuplicateKeyError,
+    PyMongoError,
+)
 
 from mlflow_mongodb.infrastructure.array_operations import (
     build_array_value_expression,
@@ -44,6 +49,7 @@ from mlflow_mongodb.infrastructure.array_operations import (
 from mlflow_mongodb.infrastructure.repository_operations import repository_operation
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 from mlflow_mongodb.tracking._retry import retry_on_exception
+
 from mlflow_mongodb.infrastructure.errors import (
     RepositoryPersistenceError,
     RepositoryNotFoundError,
@@ -294,11 +300,15 @@ class TraceRepository:
 
     def _get_assessments(self, trace_id: str) -> tuple[dict[str, Any], ...]:
         with repository_operation("Unable to read trace assessments."):
+            # todo: do not put the list(cursor) just return here or something
+            # force that list and the iterate is extrange, I know that here we track the error
+            # but it seems off
             cursor = self._assessments_collection.find(
                 {"trace_id": trace_id},
                 {"_id": 0, "content": 1},
             ).sort([("assessment_id", ASCENDING)])
             documents = list(cursor)
+
         return tuple(document["content"] for document in documents)
 
     def _trace_record(self, document: dict[str, Any]) -> TraceRecord:
@@ -319,7 +329,9 @@ class TraceRepository:
             )
             for document in documents
         ]
-        with repository_operation("Unable to persist spans."):
+        with repository_operation(
+            "Unable to persist spans.", errors=(PyMongoError, BSONError, OverflowError)
+        ):
             self._spans_collection.bulk_write(operations, ordered=False)
 
     def span_summary_snapshot(
@@ -337,6 +349,7 @@ class TraceRepository:
         if trace is None:
             raise RepositoryNotFoundError(trace_id)
         with repository_operation("Unable to read trace span summary snapshot."):
+            # TODO: Again, do not do more lines of codes
             cursor = self._spans_collection.find(
                 {"trace_id": trace_id},
                 {
@@ -411,6 +424,8 @@ class TraceRepository:
             "k",
             protected_keys="$authoritative_metadata_keys",
         )
+
+        # TODO: No return? nothing nada?
         with repository_operation("Unable to update trace span summary."):
             result = self._collection.update_one(
                 {"_id": trace_id, "experiment_id": experiment_id, "span_revision": revision},
@@ -475,6 +490,7 @@ class TraceRepository:
         pipeline.append({"$project": {"_id": 1}})
 
         with repository_operation("Unable to search trace metadata."):
+            # TODO: the same as abovem the with cursor thing
             cursor = self._collection.aggregate(pipeline, allowDiskUse=True)
             with cursor:
                 documents = list(cursor)
