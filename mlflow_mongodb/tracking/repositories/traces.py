@@ -8,7 +8,7 @@ from itertools import islice
 from types import MappingProxyType
 from typing import Any, ClassVar, Final
 
-from bson.errors import BSONError
+from bson.errors import BSONError, InvalidDocument
 from mlflow.entities.trace_metrics import (
     AggregationType,
     MetricAggregation,
@@ -35,7 +35,13 @@ from mlflow.tracing.constant import (
 from mlflow.utils.search_utils import SearchTraceMetricsUtils, SearchUtils
 from pymongo import ASCENDING, DESCENDING, ReplaceOne, ReturnDocument, UpdateOne
 from pymongo.database import Database
-from pymongo.errors import DuplicateKeyError, PyMongoError
+from pymongo.errors import (
+    BulkWriteError,
+    DocumentTooLarge,
+    DuplicateKeyError,
+    OperationFailure,
+    PyMongoError,
+)
 
 from mlflow_mongodb.infrastructure._array_updates import (
     build_array_value_expression,
@@ -45,6 +51,8 @@ from mlflow_mongodb.infrastructure._array_updates import (
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 from mlflow_mongodb.tracking._retry import retry_on_exception
 from mlflow_mongodb.tracking.errors import (
+    RepositoryDocumentTooLargeError,
+    RepositoryInvalidDocumentError,
     RepositoryPersistenceError,
     RepositoryNotFoundError,
     RepositoryWriteConflictError,
@@ -316,7 +324,9 @@ class TraceRepository:
         try:
             self._assessments_collection.bulk_write(operations, ordered=True)
         except (PyMongoError, BSONError) as exc:
-            raise RepositoryPersistenceError("Database operation '_upsert_assessments' failed.") from exc
+            raise RepositoryPersistenceError(
+                "Database operation '_upsert_assessments' failed."
+            ) from exc
 
     def _get_assessments(self, trace_id: str) -> tuple[dict[str, Any], ...]:
         try:
@@ -325,11 +335,15 @@ class TraceRepository:
                 {"_id": 0, "content": 1},
             ).sort([("assessment_id", ASCENDING)])
         except (PyMongoError, BSONError) as exc:
-            raise RepositoryPersistenceError("Database operation '_get_assessments' failed.") from exc
+            raise RepositoryPersistenceError(
+                "Database operation '_get_assessments' failed."
+            ) from exc
         try:
             documents = list(cursor)
         except (PyMongoError, BSONError) as exc:
-            raise RepositoryPersistenceError("Database operation '_get_assessments' failed.") from exc
+            raise RepositoryPersistenceError(
+                "Database operation '_get_assessments' failed."
+            ) from exc
         return tuple(document["content"] for document in documents)
 
     def _trace_record(self, document: dict[str, Any]) -> TraceRecord:
@@ -352,6 +366,32 @@ class TraceRepository:
         ]
         try:
             self._spans_collection.bulk_write(operations, ordered=False)
+        except DocumentTooLarge as exc:
+            raise RepositoryDocumentTooLargeError(
+                "A span document exceeds the BSON size limit."
+            ) from exc
+        except (InvalidDocument, OverflowError) as exc:
+            raise RepositoryInvalidDocumentError(
+                "A span document cannot be encoded as BSON."
+            ) from exc
+        except BulkWriteError as exc:
+            # MongoDB 8.0 upserts use 17419/17420; newer servers use BSONObjectTooLarge.
+            write_errors = exc.details.get("writeErrors", [])
+            if (
+                write_errors
+                and not exc.details.get("writeConcernErrors")
+                and all(error.get("code") in {10334, 17419, 17420} for error in write_errors)
+            ):
+                raise RepositoryDocumentTooLargeError(
+                    "A span document exceeds the BSON size limit."
+                ) from exc
+            raise RepositoryPersistenceError("Database operation 'log_spans' failed.") from exc
+        except OperationFailure as exc:
+            if exc.code in {10334, 17419, 17420}:
+                raise RepositoryDocumentTooLargeError(
+                    "A span document exceeds the BSON size limit."
+                ) from exc
+            raise RepositoryPersistenceError("Database operation 'log_spans' failed.") from exc
         except (PyMongoError, BSONError) as exc:
             raise RepositoryPersistenceError("Database operation 'log_spans' failed.") from exc
 
@@ -368,7 +408,9 @@ class TraceRepository:
                 return_document=ReturnDocument.AFTER,
             )
         except (PyMongoError, BSONError) as exc:
-            raise RepositoryPersistenceError("Database operation 'span_summary_snapshot' failed.") from exc
+            raise RepositoryPersistenceError(
+                "Database operation 'span_summary_snapshot' failed."
+            ) from exc
         if trace is None:
             raise RepositoryNotFoundError(trace_id)
         try:
@@ -387,12 +429,16 @@ class TraceRepository:
                 },
             ).sort([("start_time_ns", ASCENDING), ("span_id", ASCENDING)])
         except (PyMongoError, BSONError) as exc:
-            raise RepositoryPersistenceError("Database operation 'span_summary_snapshot' failed.") from exc
+            raise RepositoryPersistenceError(
+                "Database operation 'span_summary_snapshot' failed."
+            ) from exc
         try:
             with cursor:
                 documents = list(cursor)
         except (PyMongoError, BSONError) as exc:
-            raise RepositoryPersistenceError("Database operation 'span_summary_snapshot' failed.") from exc
+            raise RepositoryPersistenceError(
+                "Database operation 'span_summary_snapshot' failed."
+            ) from exc
         return trace["span_revision"], [SpanSummaryRecord.from_document(d) for d in documents]
 
     def update_span_summary(
@@ -457,7 +503,9 @@ class TraceRepository:
                 [{"$set": fields}, {"$set": {"trace_metadata": metadata_update}}],
             )
         except (PyMongoError, BSONError) as exc:
-            raise RepositoryPersistenceError("Database operation 'update_span_summary' failed.") from exc
+            raise RepositoryPersistenceError(
+                "Database operation 'update_span_summary' failed."
+            ) from exc
         if not result.matched_count:
             raise RepositoryWriteConflictError(trace_id)
 
@@ -523,12 +571,16 @@ class TraceRepository:
             # IT IS HARD TO PUT A BOUNDARY HERE HAHA
             cursor = self._collection.aggregate(pipeline, allowDiskUse=True)
         except (PyMongoError, BSONError) as exc:
-            raise RepositoryPersistenceError("Database operation 'search_trace_infos' failed.") from exc
+            raise RepositoryPersistenceError(
+                "Database operation 'search_trace_infos' failed."
+            ) from exc
         try:
             with cursor:
                 documents = list(cursor)
         except (PyMongoError, BSONError) as exc:
-            raise RepositoryPersistenceError("Database operation 'search_trace_infos' failed.") from exc
+            raise RepositoryPersistenceError(
+                "Database operation 'search_trace_infos' failed."
+            ) from exc
         trace_ids = [document["_id"] for document in documents]
         return self.batch_get_trace_infos(trace_ids, experiment_ids=experiment_ids)
 
@@ -703,7 +755,9 @@ class TraceRepository:
             try:
                 documents = list(self._collection.aggregate(pipeline))
             except (PyMongoError, BSONError) as exc:
-                raise RepositoryPersistenceError("Database operation '_batch_get_trace_records' failed.") from exc
+                raise RepositoryPersistenceError(
+                    "Database operation '_batch_get_trace_records' failed."
+                ) from exc
             for document in documents:
                 record = TraceRecord.from_document(
                     document,
@@ -755,7 +809,9 @@ class TraceRepository:
         try:
             rows = list(self._collection.aggregate(pipeline, allowDiskUse=True))
         except (PyMongoError, BSONError) as exc:
-            raise RepositoryPersistenceError("Database operation 'query_trace_metrics' failed.") from exc
+            raise RepositoryPersistenceError(
+                "Database operation 'query_trace_metrics' failed."
+            ) from exc
         if (
             not rows
             and not dimensions
@@ -773,7 +829,9 @@ class TraceRepository:
                 [
                     {
                         "$set": {
-                            "tags": build_merge_array_expression("$tags", [{"k": key, "v": value}], "k")
+                            "tags": build_merge_array_expression(
+                                "$tags", [{"k": key, "v": value}], "k"
+                            )
                         }
                     }
                 ],
@@ -794,7 +852,9 @@ class TraceRepository:
                 return_document=ReturnDocument.AFTER,
             )
         except (PyMongoError, BSONError) as exc:
-            raise RepositoryPersistenceError("Database operation 'delete_trace_tag' failed.") from exc
+            raise RepositoryPersistenceError(
+                "Database operation 'delete_trace_tag' failed."
+            ) from exc
         if document is None:
             raise RepositoryNotFoundError(trace_id)
 
@@ -877,7 +937,9 @@ class TraceRepository:
                 try:
                     documents = list(islice(cursor, 500))
                 except (PyMongoError, BSONError) as exc:
-                    raise RepositoryPersistenceError("Database operation 'delete_traces' failed.") from exc
+                    raise RepositoryPersistenceError(
+                        "Database operation 'delete_traces' failed."
+                    ) from exc
                 selected_ids = {document["_id"] for document in documents}
                 if not selected_ids:
                     break
@@ -886,11 +948,15 @@ class TraceRepository:
                 try:
                     self._spans_collection.delete_many({"trace_id": {"$in": selected_ids}})
                 except (PyMongoError, BSONError) as exc:
-                    raise RepositoryPersistenceError("Database operation 'delete_traces' failed.") from exc
+                    raise RepositoryPersistenceError(
+                        "Database operation 'delete_traces' failed."
+                    ) from exc
                 try:
                     self._assessments_collection.delete_many({"trace_id": {"$in": selected_ids}})
                 except (PyMongoError, BSONError) as exc:
-                    raise RepositoryPersistenceError("Database operation 'delete_traces' failed.") from exc
+                    raise RepositoryPersistenceError(
+                        "Database operation 'delete_traces' failed."
+                    ) from exc
                 # Keeping metadata until span deletion succeeds allows retries
                 # to find traces whose span cleanup failed or was interrupted.
                 try:
@@ -901,7 +967,9 @@ class TraceRepository:
                         }
                     )
                 except (PyMongoError, BSONError) as exc:
-                    raise RepositoryPersistenceError("Database operation 'delete_traces' failed.") from exc
+                    raise RepositoryPersistenceError(
+                        "Database operation 'delete_traces' failed."
+                    ) from exc
                 deleted_count += result.deleted_count
         return deleted_count
 

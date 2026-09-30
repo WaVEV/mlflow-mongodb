@@ -70,7 +70,11 @@ class LoggedModelRepository:
         # The model ID is the document's _id, which already has a unique index.
         try:
             self._collection.create_index(
-                [("experiment_id", ASCENDING), ("creation_timestamp", DESCENDING), ("_id", ASCENDING)],
+                [
+                    ("experiment_id", ASCENDING),
+                    ("creation_timestamp", DESCENDING),
+                    ("_id", ASCENDING),
+                ],
                 name="logged_models_experiment_creation_id",
             )
         except (PyMongoError, BSONError) as exc:
@@ -104,7 +108,11 @@ class LoggedModelRepository:
             raise RepositoryPersistenceError("Database operation '__init__' failed.") from exc
         try:
             self._metrics_collection.create_index(
-                [("model_id", ASCENDING), ("dataset_name", ASCENDING), ("dataset_digest", ASCENDING)],
+                [
+                    ("model_id", ASCENDING),
+                    ("dataset_name", ASCENDING),
+                    ("dataset_digest", ASCENDING),
+                ],
                 name="run_metrics_model_dataset",
             )
         except (PyMongoError, BSONError) as exc:
@@ -309,11 +317,15 @@ class LoggedModelRepository:
                     ]
                 )
             except (PyMongoError, BSONError) as exc:
-                raise RepositoryPersistenceError("Database operation '_get_metrics_by_model' failed.") from exc
+                raise RepositoryPersistenceError(
+                    "Database operation '_get_metrics_by_model' failed."
+                ) from exc
             try:
                 metric_documents = list(metrics)
             except (PyMongoError, BSONError) as exc:
-                raise RepositoryPersistenceError("Database operation '_get_metrics_by_model' failed.") from exc
+                raise RepositoryPersistenceError(
+                    "Database operation '_get_metrics_by_model' failed."
+                ) from exc
             for metric in metric_documents:
                 metrics_by_model[metric["model_id"]].append(RunMetricRecord.from_document(metric))
 

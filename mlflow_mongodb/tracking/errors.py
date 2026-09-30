@@ -5,6 +5,14 @@ class RepositoryPersistenceError(Exception):
     """Raised when a repository database operation fails."""
 
 
+class RepositoryInvalidDocumentError(Exception):
+    """Raised when a document cannot be encoded as BSON."""
+
+
+class RepositoryDocumentTooLargeError(Exception):
+    """Raised when a document exceeds MongoDB's BSON size limit."""
+
+
 class RepositoryAlreadyExistsError(Exception):
     """Raised when a resource with the requested unique identity already exists."""
 
