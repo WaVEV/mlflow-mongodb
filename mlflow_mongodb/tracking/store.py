@@ -1,15 +1,18 @@
 """Skeleton of the MongoDB tracking store for the agreed V1 scope."""
 
 import asyncio
+import binascii
 import json
 import logging
+import math
 import re
 from collections import defaultdict
 from functools import cached_property
 from typing import Any
 from uuid import uuid4
 
-from bson.errors import BSONError
+from bson import BSON, ObjectId
+from bson.errors import BSONError, InvalidDocument
 from mlflow.entities import (
     Assessment,
     Dataset,
@@ -42,6 +45,7 @@ from mlflow.entities.logged_model_status import LoggedModelStatus
 from mlflow.entities.logged_model_tag import LoggedModelTag
 from mlflow.entities.model_registry import PromptVersion
 from mlflow.entities.span import Span
+from mlflow.entities.span_status import SpanStatusCode
 from mlflow.entities.trace_metrics import (
     MetricAggregation,
     MetricDataPoint,
@@ -66,11 +70,22 @@ from mlflow.store.tracking import (
 )
 from mlflow.store.tracking.abstract_store import AbstractStore
 from mlflow.tracing.constant import (
+    TRACE_REQUEST_RESPONSE_PREVIEW_MAX_LENGTH_OSS,
+    GenAiSemconvKey,
+    SpanAttributeKey,
     SpansLocation,
     TraceMetadataKey,
     TraceSizeStatsKey,
     TraceTagKey,
 )
+from mlflow.tracing.otel.translation import translate_span_when_storing
+from mlflow.tracing.utils import (
+    SpanAggregationNode,
+    aggregate_cost_from_span_nodes,
+    aggregate_usage_from_span_nodes,
+    try_json_loads,
+)
+from mlflow.tracing.utils.truncation import _get_truncated_preview
 from mlflow.utils.mlflow_tags import MLFLOW_RUN_NAME, _get_run_name_from_tags
 from mlflow.utils.name_utils import _generate_random_name
 from mlflow.utils.search_utils import (
@@ -115,28 +130,23 @@ from mlflow_mongodb.tracking.errors import (
     TraceNotFoundError,
     TraceWriteConflictError,
 )
-from mlflow_mongodb.tracking.logged_model_search import (
-    parse_logged_model_filters,
-    parse_logged_model_order,
-    parse_logged_model_page_token,
-    validate_logged_model_datasets,
-)
 from mlflow_mongodb.tracking.repositories import (
     ExperimentRepository,
     LoggedModelRepository,
     RunRepository,
 )
 from mlflow_mongodb.tracking.repositories.experiments import ExperimentFilter, ExperimentOrder
+from mlflow_mongodb.tracking.repositories.logged_models import LoggedModelFilter, LoggedModelOrder
 from mlflow_mongodb.tracking.repositories.traces import (
     TraceRepository,
     TraceSearchFilter,
     TraceSearchOrder,
 )
-from mlflow_mongodb.tracking.trace_utils import numeric_stats, span_to_document, summarize_spans
 from mlflow_mongodb.tracking.types import (
     LoggedModelRecord,
     RunMetricRecord,
     SpanRecord,
+    SpanSummaryRecord,
     TraceRecord,
 )
 
@@ -147,6 +157,33 @@ except ImportError:
     SearchEvaluationDatasetsUtils = None
 
 logger = logging.getLogger(__name__)
+
+_MAX_BSON_DOCUMENT_BYTES = 16 * 1024 * 1024
+
+_LOGGED_MODEL_ATTRIBUTE_ALIASES = {
+    "creation_time": "creation_timestamp",
+    "creation_timestamp_ms": "creation_timestamp",
+    "last_updated_timestamp_ms": "last_updated_timestamp",
+}
+_LOGGED_MODEL_ATTRIBUTES = {
+    "model_id",
+    "experiment_id",
+    "name",
+    "artifact_location",
+    "creation_timestamp",
+    "last_updated_timestamp",
+    "lifecycle_stage",
+    "model_type",
+    "source_run_id",
+    "status_message",
+}
+_LOGGED_MODEL_NUMERIC_ATTRIBUTES = {"creation_timestamp", "last_updated_timestamp"}
+_LOGGED_MODEL_ENTITY_TYPES = {
+    "attributes": "attribute",
+    "metrics": "metric",
+    "params": "param",
+    "tags": "tag",
+}
 
 
 class _TraceNotFullyExportedError(Exception):
@@ -807,7 +844,7 @@ class MongoDBTrackingStore(AbstractStore):
                     else None
                 ),
                 metrics={
-                    field: numeric_stats(trace_info.trace_metadata[key])
+                    field: self._numeric_trace_stats(trace_info.trace_metadata[key])
                     for field, key in (
                         ("token_usage", TraceMetadataKey.TOKEN_USAGE),
                         ("cost", TraceMetadataKey.COST),
@@ -1039,7 +1076,178 @@ class MongoDBTrackingStore(AbstractStore):
             )
 
     @staticmethod
+    def _span_attribute_value(value: Any) -> Any:
+        # Span.to_dict() retains MLflow's JSON-encoded OTel attribute values.
+        # Decode only the fields used for queries; preserve content for Span.from_dict().
+        return try_json_loads(value) if isinstance(value, str) else value
+
+    @classmethod
+    def _numeric_trace_stats(cls, value: Any) -> dict | None:
+        """Read optional numeric usage/cost attributes without failing span ingestion."""
+        value = cls._span_attribute_value(value)
+        if not isinstance(value, dict):
+            return None
+        if any(
+            isinstance(number, bool)
+            or not isinstance(number, (int, float))
+            or (isinstance(number, float) and not math.isfinite(number))
+            for number in value.values()
+        ):
+            return None
+        return value
+
+    @staticmethod
+    def _add_span_trace_tag(tags: dict[str, str], key: str, value: Any) -> None:
+        try:
+            value = value if isinstance(value, str) else json.dumps(value)
+            key, value = _validate_trace_tag(key, value)
+        except (MlflowException, TypeError, ValueError):
+            logger.debug("Skipping invalid span-derived trace tag %r", key)
+            return
+        tags[key] = value
+
+    @staticmethod
+    def _span_preview(value: Any, role: str) -> str | None:
+        try:
+            if value is not None and not isinstance(value, (str, dict)):
+                value = json.dumps(value)
+            preview = _get_truncated_preview(value, role=role)
+            # MLflow's helper consults the process-global URI for its size limit.
+            # A direct MongoDB store always uses the OSS limit, even in mixed clients.
+            if preview is not None and len(preview) > TRACE_REQUEST_RESPONSE_PREVIEW_MAX_LENGTH_OSS:
+                return preview[: TRACE_REQUEST_RESPONSE_PREVIEW_MAX_LENGTH_OSS - 3] + "..."
+            return preview
+        except (TypeError, ValueError, AttributeError):
+            logger.debug("Could not extract the %s trace preview", role, exc_info=True)
+            return None
+
+    @classmethod
+    def _span_to_document(cls, span: Span) -> dict[str, Any]:
+        """Keep full span content plus compact native fields for summary queries."""
+
+        content = translate_span_when_storing(span)
+        attributes = content.get("attributes", {})
+        root = span.parent_id is None
+        resource_tags = {}
+        resource = getattr(span._span, "resource", None)
+        if resource is not None:
+            for key, value in resource.attributes.items():
+                if not key.startswith(("telemetry.sdk.", "mlflow.")):
+                    cls._add_span_trace_tag(resource_tags, key, value)
+        root_tags = {}
+        if root:
+            for key, value in attributes.items():
+                if key.startswith(SpanAttributeKey.TRACE_TAG_PREFIX):
+                    tag_key = key[len(SpanAttributeKey.TRACE_TAG_PREFIX) :]
+                    if tag_key != TraceTagKey.SPANS_LOCATION:
+                        cls._add_span_trace_tag(
+                            root_tags, tag_key, cls._span_attribute_value(value)
+                        )
+
+        metadata = {}
+        session_id = attributes.get(SpanAttributeKey.SESSION_ID) or attributes.get(
+            GenAiSemconvKey.CONVERSATION_ID
+        )
+        for key, value in (
+            (TraceMetadataKey.TRACE_SESSION, session_id),
+            (TraceMetadataKey.TRACE_USER, attributes.get(SpanAttributeKey.USER_ID)),
+        ):
+            if value is not None:
+                metadata[key] = str(cls._span_attribute_value(value))
+
+        document = {
+            "trace_id": span.trace_id,
+            "span_id": span.span_id,
+            "parent_span_id": span.parent_id,
+            "name": span.name,
+            "type": cls._span_attribute_value(attributes.get(SpanAttributeKey.SPAN_TYPE))
+            or span.span_type,
+            "status": span.status.status_code.value,
+            "start_time_ns": span.start_time_ns,
+            "end_time_ns": span.end_time_ns,
+            "content": content,
+            "dimension_attributes": {
+                key: cls._span_attribute_value(attributes[key])
+                for key in (SpanAttributeKey.MODEL, SpanAttributeKey.MODEL_PROVIDER)
+                if key in attributes
+            },
+            "token_usage": cls._numeric_trace_stats(attributes.get(SpanAttributeKey.CHAT_USAGE)),
+            "cost": cls._numeric_trace_stats(attributes.get(SpanAttributeKey.LLM_COST)),
+            "trace_fields": {
+                "metadata": metadata,
+                "resource_tags": resource_tags,
+                "root_tags": root_tags,
+                "request_preview": cls._span_preview(
+                    attributes.get(SpanAttributeKey.INPUTS), "user"
+                )
+                if root
+                else None,
+                "response_preview": cls._span_preview(
+                    attributes.get(SpanAttributeKey.OUTPUTS), "assistant"
+                )
+                if root
+                else None,
+            },
+        }
+        # Include the automatically assigned _id in the size check. Validate the whole
+        # batch before any writes, including BSON type/size failures in later spans.
+        try:
+            size = len(BSON.encode({"_id": ObjectId(), **document}))
+        except (InvalidDocument, OverflowError, ValueError, TypeError):
+            logger.exception("Unable to encode span as BSON")
+            raise MlflowException.invalid_parameter_value(
+                f"Span '{span.span_id}' in trace '{span.trace_id}' cannot be stored as BSON."
+            ) from None
+        if size > _MAX_BSON_DOCUMENT_BYTES:
+            raise MlflowException.invalid_parameter_value(
+                f"Span '{span.span_id}' in trace '{span.trace_id}' exceeds MongoDB's "
+                "16 MiB document limit."
+            )
+        return document
+
+    @staticmethod
+    def _summarize_spans(documents: list[SpanSummaryRecord]) -> dict[str, Any]:
+        """Recompute from unique persisted spans, including parents arriving in later batches."""
+
+        start_ms = min(document.start_time_ns for document in documents) // 1_000_000
+        end_times = [d.end_time_ns for d in documents if d.end_time_ns is not None]
+        root = next((d for d in documents if d.parent_span_id is None), None)
+        metadata = {}
+        tags = {}
+        for document in documents:
+            for key, value in document.trace_fields["metadata"].items():
+                metadata.setdefault(key, value)
+            for key, value in document.trace_fields["resource_tags"].items():
+                tags.setdefault(key, value)
+        if root:
+            tags.update(root.trace_fields["root_tags"])
+
+        if not root:
+            state = TraceState.IN_PROGRESS.value
+        elif root.status == SpanStatusCode.ERROR.value:
+            state = TraceState.ERROR.value
+        else:
+            state = TraceState.OK.value
+
+        return {
+            "request_time": start_ms,
+            "execution_duration": max(end_times) // 1_000_000 - start_ms if end_times else None,
+            "state": state,
+            "request_preview": root.trace_fields["request_preview"] if root else None,
+            "response_preview": root.trace_fields["response_preview"] if root else None,
+            "tags": tags,
+            "metadata": metadata,
+            "token_usage": aggregate_usage_from_span_nodes(
+                [SpanAggregationNode(d.span_id, d.parent_span_id, d.token_usage) for d in documents]
+            ),
+            "cost": aggregate_cost_from_span_nodes(
+                [SpanAggregationNode(d.span_id, d.parent_span_id, d.cost) for d in documents]
+            ),
+        }
+
+    @classmethod
     def _prepare_span_documents(
+        cls,
         spans: list[Span],
     ) -> tuple[list[dict[str, Any]], defaultdict[str, list[dict[str, Any]]]]:
         # First delivery wins, including repeated identities in the same batch.
@@ -1048,7 +1256,7 @@ class MongoDBTrackingStore(AbstractStore):
         for span in spans:
             identity = (span.trace_id, span.span_id)
             if identity not in documents_by_identity:
-                documents_by_identity[identity] = span_to_document(span)
+                documents_by_identity[identity] = cls._span_to_document(span)
 
         documents_by_trace = defaultdict(list)
         for document in documents_by_identity.values():
@@ -1111,7 +1319,7 @@ class MongoDBTrackingStore(AbstractStore):
             # Span deletion precedes trace deletion; do not finalize an empty
             # snapshot or invent a successful write while deletion is in progress.
             raise TraceNotFoundError(trace_id)
-        summary = summarize_spans(documents)
+        summary = self._summarize_spans(documents)
         # MLflow's trace_metadata contract requires strings. The corresponding
         # native fields are stored in the same atomic update for MongoDB queries.
         summary["aggregate_metadata"] = {
@@ -1425,6 +1633,183 @@ class MongoDBTrackingStore(AbstractStore):
             or None,
         )
 
+    @staticmethod
+    def _logged_model_attribute_key(key: str) -> str:
+        key = _LOGGED_MODEL_ATTRIBUTE_ALIASES.get(key, key)
+        if key not in _LOGGED_MODEL_ATTRIBUTES:
+            raise MlflowException.invalid_parameter_value(
+                f"Invalid logged model attribute: {key!r}."
+            )
+        return key
+
+    @staticmethod
+    def _validate_logged_model_datasets(datasets: list[dict[str, Any]] | None) -> None:
+        if datasets is None:
+            return
+        if not isinstance(datasets, list):
+            raise MlflowException.invalid_parameter_value(
+                "`datasets` must be a list of dictionaries."
+            )
+        for dataset in datasets:
+            if not isinstance(dataset, dict) or not dataset.get("dataset_name"):
+                raise MlflowException.invalid_parameter_value(
+                    "`dataset_name` in the `datasets` clause must be specified."
+                )
+            if not isinstance(dataset["dataset_name"], str) or (
+                dataset.get("dataset_digest") is not None
+                and not isinstance(dataset["dataset_digest"], str)
+            ):
+                raise MlflowException.invalid_parameter_value(
+                    "Dataset names and digests must be strings."
+                )
+
+    @classmethod
+    def _parse_logged_model_filters(
+        cls, filter_string: str | None
+    ) -> tuple[LoggedModelFilter, ...]:
+        # The parser imports SQL models; defer it until MLflow finishes store discovery.
+        from mlflow.utils.search_logged_model_utils import (  # ruff: ignore[import-outside-top-level]
+            parse_filter_string,
+        )
+
+        if filter_string is not None and not isinstance(filter_string, str):
+            raise MlflowException.invalid_parameter_value("`filter_string` must be a string.")
+        try:
+            comparisons = parse_filter_string(filter_string)
+        except (ValueError, TypeError, SyntaxError):
+            raise MlflowException.invalid_parameter_value(
+                "Invalid logged model filter string."
+            ) from None
+
+        filters = []
+        for comparison in comparisons:
+            field_type = _LOGGED_MODEL_ENTITY_TYPES[comparison.entity.type.value]
+            key = comparison.entity.key
+            if field_type == "attribute":
+                key = cls._logged_model_attribute_key(key)
+            if not key:
+                raise MlflowException.invalid_parameter_value("Search keys must not be empty.")
+            value = comparison.value
+            if field_type == "metric" or (
+                field_type == "attribute" and key in _LOGGED_MODEL_NUMERIC_ATTRIBUTES
+            ):
+                if not isinstance(value, (int, float)) or not math.isfinite(value):
+                    raise MlflowException.invalid_parameter_value(
+                        "Numeric filters require finite numbers."
+                    )
+            elif comparison.op in ("IN", "NOT IN"):
+                if not isinstance(value, (list, tuple)) or not all(
+                    isinstance(v, str) for v in value
+                ):
+                    raise MlflowException.invalid_parameter_value(
+                        "IN and NOT IN require a list of string values."
+                    )
+                value = tuple(value)
+            elif not isinstance(value, str):
+                raise MlflowException.invalid_parameter_value(
+                    "String filters require string values."
+                )
+            filters.append(LoggedModelFilter(field_type, key, comparison.op, value))
+        return tuple(filters)
+
+    @classmethod
+    def _parse_logged_model_order(
+        cls, order_by: list[dict[str, Any]] | None
+    ) -> tuple[LoggedModelOrder, ...]:
+        if order_by is not None and not isinstance(order_by, list):
+            raise MlflowException.invalid_parameter_value(
+                "`order_by` must be a list of dictionaries."
+            )
+        orders = []
+        seen = set()
+        for order in order_by or []:
+            if not isinstance(order, dict) or not isinstance(order.get("field_name"), str):
+                raise MlflowException.invalid_parameter_value(
+                    "`field_name` in the `order_by` clause must be specified as a string."
+                )
+            field = order["field_name"]
+            if "." in field:
+                entity, key = field.split(".", 1)
+                if entity != "metrics" or not key:
+                    raise MlflowException.invalid_parameter_value(
+                        f"Invalid order by field name: {field!r}. Only metrics support a prefix."
+                    )
+                field_type = "metric"
+            else:
+                key = cls._logged_model_attribute_key(field)
+                field_type = "attribute"
+            ascending = order.get("ascending", True)
+            if not isinstance(ascending, bool):
+                raise MlflowException.invalid_parameter_value("`ascending` must be a boolean.")
+            dataset_name = order.get("dataset_name")
+            dataset_digest = order.get("dataset_digest")
+            if any(
+                value is not None and not isinstance(value, str)
+                for value in (dataset_name, dataset_digest)
+            ):
+                raise MlflowException.invalid_parameter_value(
+                    "Dataset names and digests must be strings."
+                )
+            if dataset_digest and not dataset_name:
+                raise MlflowException.invalid_parameter_value(
+                    "`dataset_digest` can only be specified if `dataset_name` is also specified."
+                )
+            if field_type != "metric" and (dataset_name or dataset_digest):
+                raise MlflowException.invalid_parameter_value(
+                    "Dataset ordering applies only to metrics."
+                )
+            identity = (field_type, key, dataset_name or None, dataset_digest or None)
+            # Later repetitions of the same sort expression cannot change its ordering.
+            if identity not in seen:
+                seen.add(identity)
+                orders.append(
+                    LoggedModelOrder(field_type, key, ascending, dataset_name, dataset_digest)
+                )
+        for key, ascending in (("creation_timestamp", False), ("model_id", True)):
+            if not any(order.field_type == "attribute" and order.key == key for order in orders):
+                orders.append(LoggedModelOrder("attribute", key, ascending))
+        sort_keys = sum(
+            2
+            if order.field_type == "metric"
+            or order.key
+            in {
+                "model_type",
+                "source_run_id",
+                "status_message",
+            }
+            else 1
+            for order in orders
+        )
+        if sort_keys > 32:
+            raise MlflowException.invalid_parameter_value("Too many order_by fields.")
+        return tuple(orders)
+
+    @staticmethod
+    def _parse_logged_model_page_token(
+        page_token: str | None,
+        experiment_ids: list[str],
+        filter_string: str | None,
+        order_by: list[dict[str, Any]] | None,
+    ) -> int:
+        if page_token is not None and not isinstance(page_token, str):
+            raise MlflowException.invalid_parameter_value("Invalid logged model page token.")
+        if not page_token:
+            return 0
+        try:
+            token = SearchLoggedModelsPaginationToken.decode(page_token)
+        except (MlflowException, ValueError, TypeError, AttributeError, binascii.Error):
+            raise MlflowException.invalid_parameter_value(
+                "Invalid logged model page token."
+            ) from None
+        if (
+            isinstance(token.offset, bool)
+            or not isinstance(token.offset, int)
+            or not 0 <= token.offset < 2**63
+        ):
+            raise MlflowException.invalid_parameter_value("Invalid logged model page token offset.")
+        token.validate(experiment_ids, filter_string or None, order_by or None)
+        return token.offset
+
     def search_logged_models(
         self,
         experiment_ids: list[str],
@@ -1435,14 +1820,16 @@ class MongoDBTrackingStore(AbstractStore):
         page_token: str | None = None,
     ) -> PagedList[LoggedModel]:
         """Search model metadata and associated metrics within the requested experiments."""
-        validate_logged_model_datasets(datasets)
+        self._validate_logged_model_datasets(datasets)
         if not isinstance(experiment_ids, list) or not all(
             isinstance(experiment_id, str) for experiment_id in experiment_ids
         ):
             raise MlflowException.invalid_parameter_value(
                 "`experiment_ids` must be a list of strings."
             )
-        offset = parse_logged_model_page_token(page_token, experiment_ids, filter_string, order_by)
+        offset = self._parse_logged_model_page_token(
+            page_token, experiment_ids, filter_string, order_by
+        )
         if isinstance(max_results, bool) or (
             max_results is not None and not isinstance(max_results, int)
         ):
@@ -1452,8 +1839,8 @@ class MongoDBTrackingStore(AbstractStore):
             raise MlflowException.invalid_parameter_value(
                 "`max_results` must be a positive integer."
             )
-        filters = parse_logged_model_filters(filter_string)
-        orders = parse_logged_model_order(order_by)
+        filters = self._parse_logged_model_filters(filter_string)
+        orders = self._parse_logged_model_order(order_by)
         if not experiment_ids:
             return PagedList([], None)
         try:
