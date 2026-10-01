@@ -4,7 +4,6 @@ import logging
 from functools import cached_property
 from uuid import uuid4
 
-from bson.errors import BSONError
 from mlflow.entities import Experiment, ExperimentTag, LifecycleStage, ViewType
 from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import (
@@ -28,13 +27,14 @@ from mlflow.utils.validation import (
 )
 from pymongo import MongoClient
 from pymongo.database import Database
-from pymongo.errors import ConfigurationError, PyMongoError
+from pymongo.errors import ConfigurationError
 
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 from mlflow_mongodb.tracking.errors import (
     ExperimentAlreadyExistsError,
     ExperimentNotActiveError,
     ExperimentNotFoundError,
+    ExperimentPersistenceError,
 )
 from mlflow_mongodb.tracking.repositories import ExperimentRepository
 from mlflow_mongodb.tracking.repositories.experiments import ExperimentFilter, ExperimentOrder
@@ -114,7 +114,7 @@ class MongoDBTrackingStore(AbstractStore):
                 offset=offset,
                 limit=max_results + 1,
             )
-        except (PyMongoError, BSONError):
+        except ExperimentPersistenceError:
             logger.exception("Unable to search experiments")
             raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
 
@@ -200,9 +200,13 @@ class MongoDBTrackingStore(AbstractStore):
                 tags=tags_by_key,
             )
         except ExperimentAlreadyExistsError as exc:
+            logger.error("Unable to create experiment: %s", exc)
             raise MlflowException(
                 f"Experiment(name={name}) already exists.", RESOURCE_ALREADY_EXISTS
-            ) from exc
+            ) from None
+        except ExperimentPersistenceError as exc:
+            logger.error("Unable to create experiment: %s", exc)
+            raise MlflowException("Unable to create experiment.", INTERNAL_ERROR) from None
 
     def get_experiment(self, experiment_id: str | None) -> Experiment:
         experiment_id = None if experiment_id is None else str(experiment_id)
@@ -245,9 +249,10 @@ class MongoDBTrackingStore(AbstractStore):
                 last_update_time=get_current_time_millis(),
             )
         except ExperimentNotFoundError as exc:
+            logger.error("Unable to delete experiment: %s", exc)
             raise MlflowException(
                 f"No Experiment with id={experiment_id} exists", RESOURCE_DOES_NOT_EXIST
-            ) from exc
+            ) from None
 
     def restore_experiment(self, experiment_id: str) -> None:
         try:
@@ -256,9 +261,10 @@ class MongoDBTrackingStore(AbstractStore):
                 last_update_time=get_current_time_millis(),
             )
         except ExperimentNotFoundError as exc:
+            logger.error("Unable to restore experiment: %s", exc)
             raise MlflowException(
                 f"No Experiment with id={experiment_id} exists", RESOURCE_DOES_NOT_EXIST
-            ) from exc
+            ) from None
 
     def rename_experiment(self, experiment_id: str, new_name: str) -> None:
         _validate_experiment_name(new_name)
@@ -270,16 +276,18 @@ class MongoDBTrackingStore(AbstractStore):
                 last_update_time=get_current_time_millis(),
             )
         except ExperimentNotFoundError:
+            logger.exception("Unable to rename experiment: experiment not found")
             raise MlflowException(
                 f"No Experiment with id={experiment_id} exists", RESOURCE_DOES_NOT_EXIST
             ) from None
         except ExperimentNotActiveError:
+            logger.exception("Unable to rename experiment: experiment is not active")
             raise MlflowException("Cannot rename a non-active experiment.", INVALID_STATE) from None
         except ExperimentAlreadyExistsError:
             logger.exception("Unable to rename experiment: name already exists")
             raise MlflowException(
                 f"Experiment(name={new_name}) already exists.", RESOURCE_ALREADY_EXISTS
             ) from None
-        except (PyMongoError, BSONError):
+        except ExperimentPersistenceError:
             logger.exception("Unable to rename experiment")
             raise MlflowException("Unable to rename experiment.", INTERNAL_ERROR) from None

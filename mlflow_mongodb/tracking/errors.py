@@ -1,6 +1,10 @@
 """Experiment exceptions raised by the tracking store and repository."""
 
 
+class ExperimentPersistenceError(Exception):
+    """Raised when an experiment repository database operation fails."""
+
+
 class ExperimentAlreadyExistsError(Exception):
     """Raised when an experiment name is already stored."""
 
