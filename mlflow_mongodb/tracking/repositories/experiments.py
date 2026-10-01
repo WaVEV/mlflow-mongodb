@@ -17,6 +17,7 @@ from mlflow_mongodb.tracking.errors import (
     RepositoryNotActiveError,
     RepositoryNotFoundError,
     RepositoryPersistenceError,
+    translate_database_errors,
 )
 from mlflow_mongodb.tracking.types import ExperimentRecord
 
@@ -66,6 +67,7 @@ class ExperimentRepository:
         except (PyMongoError, BSONError) as exc:
             raise RepositoryPersistenceError("A database operation failed.") from exc
 
+    @translate_database_errors
     def search(
         self,
         *,
