@@ -2,18 +2,20 @@
 
 from collections.abc import Mapping
 
+from bson.errors import BSONError
 from mlflow.utils.mlflow_tags import MLFLOW_RUN_NAME
 from pymongo import ASCENDING, ReturnDocument
 from pymongo.database import Database
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from mlflow_mongodb.infrastructure._array_updates import build_merge_array_expression
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 from mlflow_mongodb.tracking.errors import (
-    RunAlreadyExistsError,
-    RunInactiveError,
-    RunNotFoundError,
-    RunParamConflictError,
+    RepositoryAlreadyExistsError,
+    RepositoryNotActiveError,
+    RepositoryNotFoundError,
+    RepositoryParamConflictError,
+    RepositoryPersistenceError,
 )
 from mlflow_mongodb.tracking.types import RunMetricRecord, RunRecord
 
@@ -24,14 +26,19 @@ class RunRepository:
     EXPERIMENT_INDEX = "runs_experiment_id"
 
     def __init__(self, database: Database, settings: MongoDBSettings | None = None):
-        self._settings = settings or MongoDBSettings()
-        self._collection = database[self._settings.runs_collection_name]
-        self._collection.create_index([("experiment_id", ASCENDING)], name=self.EXPERIMENT_INDEX)
-        self._metrics_collection = database[self._settings.run_metrics_collection_name]
-        self._metrics_collection.create_index(
-            [("run_id", ASCENDING), ("k", ASCENDING), ("timestamp", ASCENDING)],
-            name="run_metrics_run_k_timestamp",
-        )
+        try:
+            self._settings = settings or MongoDBSettings()
+            self._collection = database[self._settings.runs_collection_name]
+            self._collection.create_index(
+                [("experiment_id", ASCENDING)], name=self.EXPERIMENT_INDEX
+            )
+            self._metrics_collection = database[self._settings.run_metrics_collection_name]
+            self._metrics_collection.create_index(
+                [("run_id", ASCENDING), ("k", ASCENDING), ("timestamp", ASCENDING)],
+                name="run_metrics_run_k_timestamp",
+            )
+        except (PyMongoError, BSONError) as exc:
+            raise RepositoryPersistenceError("Database operation '__init__' failed.") from exc
 
     def create(
         self,
@@ -65,12 +72,17 @@ class RunRepository:
         try:
             self._collection.insert_one(document)
         except DuplicateKeyError as exc:
-            raise RunAlreadyExistsError(run_id) from exc
+            raise RepositoryAlreadyExistsError(run_id) from exc
+        except (PyMongoError, BSONError) as exc:
+            raise RepositoryPersistenceError("Database operation 'create' failed.") from exc
         return RunRecord.from_document(document)
 
     def find_by_id(self, run_id: str | None) -> RunRecord | None:
-        document = self._collection.find_one({"_id": run_id})
-        return RunRecord.from_document(document) if document is not None else None
+        try:
+            document = self._collection.find_one({"_id": run_id})
+            return RunRecord.from_document(document) if document is not None else None
+        except (PyMongoError, BSONError) as exc:
+            raise RepositoryPersistenceError("Database operation 'find_by_id' failed.") from exc
 
     def get_metric_history(
         self,
@@ -80,22 +92,27 @@ class RunRepository:
         offset: int = 0,
         limit: int | None = None,
     ) -> list[RunMetricRecord]:
-        cursor = (
-            self._metrics_collection.find({"run_id": run_id, "k": metric_key})
-            .sort(
-                [
-                    ("timestamp", ASCENDING),
-                    ("step", ASCENDING),
-                    ("v", ASCENDING),
-                    # Break ties consistently when otherwise identical events are stored.
-                    ("_id", ASCENDING),
-                ]
+        try:
+            cursor = (
+                self._metrics_collection.find({"run_id": run_id, "k": metric_key})
+                .sort(
+                    [
+                        ("timestamp", ASCENDING),
+                        ("step", ASCENDING),
+                        ("v", ASCENDING),
+                        # Break ties consistently when otherwise identical events are stored.
+                        ("_id", ASCENDING),
+                    ]
+                )
+                .skip(offset)
             )
-            .skip(offset)
-        )
-        if limit is not None:
-            cursor = cursor.limit(limit)
-        return [RunMetricRecord.from_document(document) for document in cursor]
+            if limit is not None:
+                cursor = cursor.limit(limit)
+            return [RunMetricRecord.from_document(document) for document in cursor]
+        except (PyMongoError, BSONError) as exc:
+            raise RepositoryPersistenceError(
+                "Database operation 'get_metric_history' failed."
+            ) from exc
 
     def mark_deleted(
         self,
@@ -103,20 +120,26 @@ class RunRepository:
         run_id: str | None,
         deleted_time: int,
     ) -> RunRecord:
-        return self._transition_lifecycle(
-            run_id=run_id,
-            current_stage="active",
-            next_stage="deleted",
-            updates={"deleted_time": deleted_time},
-        )
+        try:
+            return self._transition_lifecycle(
+                run_id=run_id,
+                current_stage="active",
+                next_stage="deleted",
+                updates={"deleted_time": deleted_time},
+            )
+        except (PyMongoError, BSONError) as exc:
+            raise RepositoryPersistenceError("Database operation 'mark_deleted' failed.") from exc
 
     def restore(self, *, run_id: str | None) -> RunRecord:
-        return self._transition_lifecycle(
-            run_id=run_id,
-            current_stage="deleted",
-            next_stage="active",
-            updates={"deleted_time": None},
-        )
+        try:
+            return self._transition_lifecycle(
+                run_id=run_id,
+                current_stage="deleted",
+                next_stage="active",
+                updates={"deleted_time": None},
+            )
+        except (PyMongoError, BSONError) as exc:
+            raise RepositoryPersistenceError("Database operation 'restore' failed.") from exc
 
     def update_info(
         self,
@@ -141,22 +164,28 @@ class RunRepository:
                 "$tags", [{"key": MLFLOW_RUN_NAME, "value": run_name}], "key"
             )
 
-        updated = self._collection.find_one_and_update(
-            {"_id": run_id, "lifecycle_stage": "active"},
-            [{"$set": fields_to_update}],
-            return_document=ReturnDocument.AFTER,
-        )
+        try:
+            updated = self._collection.find_one_and_update(
+                {"_id": run_id, "lifecycle_stage": "active"},
+                [{"$set": fields_to_update}],
+                return_document=ReturnDocument.AFTER,
+            )
+        except (PyMongoError, BSONError) as exc:
+            raise RepositoryPersistenceError("Database operation 'update_info' failed.") from exc
         if updated is None:
-            raise RunNotFoundError(run_id)
+            raise RepositoryNotFoundError(run_id)
         return RunRecord.from_document(updated)
 
     def log_batch(self, *, run_id, metrics, params, tags) -> None:
-        document = self._collection.find_one(
-            {"_id": run_id},
-            {"_id": 0, "lifecycle_stage": 1, "params": 1},
-        )
+        try:
+            document = self._collection.find_one(
+                {"_id": run_id},
+                {"_id": 0, "lifecycle_stage": 1, "params": 1},
+            )
+        except (PyMongoError, BSONError) as exc:
+            raise RepositoryPersistenceError("Unable to read run for batch logging.") from exc
         if document is None or document.get("lifecycle_stage") != "active":
-            raise RunNotFoundError(run_id)
+            raise RepositoryNotFoundError(run_id)
 
         existing_params = {
             parameter["key"]: parameter["value"] for parameter in document.get("params", [])
@@ -164,13 +193,16 @@ class RunRepository:
         for parameter in params:
             old_value = existing_params.get(parameter["key"])
             if old_value is not None and old_value != parameter["value"]:
-                raise RunParamConflictError(parameter["key"], old_value, parameter["value"], run_id)
+                raise RepositoryParamConflictError(
+                    parameter["key"], old_value, parameter["value"], run_id
+                )
 
         if metrics:
-            self._metrics_collection.insert_many(
-                [{**metric, "run_id": run_id} for metric in metrics],
-                ordered=True,
-            )
+            metric_documents = [{**metric, "run_id": run_id} for metric in metrics]
+            try:
+                self._metrics_collection.insert_many(metric_documents, ordered=True)
+            except (PyMongoError, BSONError) as exc:
+                raise RepositoryPersistenceError("Unable to insert run batch metrics.") from exc
 
         fields_to_update = {}
         if metrics:
@@ -188,12 +220,15 @@ class RunRepository:
                 fields_to_update["name"] = {"$literal": tags_by_key[MLFLOW_RUN_NAME]["value"]}
 
         if fields_to_update:
-            result = self._collection.update_one(
-                {"_id": run_id, "lifecycle_stage": "active"},
-                [{"$set": fields_to_update}],
-            )
+            try:
+                result = self._collection.update_one(
+                    {"_id": run_id, "lifecycle_stage": "active"},
+                    [{"$set": fields_to_update}],
+                )
+            except (PyMongoError, BSONError) as exc:
+                raise RepositoryPersistenceError("Unable to update run batch data.") from exc
             if result.matched_count == 0:
-                raise RunNotFoundError(run_id)
+                raise RepositoryNotFoundError(run_id)
 
     def log_inputs(self, *, run_id: str, datasets: list[dict], models: list[dict]) -> None:
         """Attach dataset and model inputs with one atomic database operation."""
@@ -208,16 +243,19 @@ class RunRepository:
         fields_to_update = {
             "inputs": {"$cond": [{"$eq": ["$lifecycle_stage", "active"]}, inputs, "$inputs"]}
         }
-        previous = self._collection.find_one_and_update(
-            {"_id": run_id},
-            [{"$set": fields_to_update}],
-            projection={"_id": 0, "lifecycle_stage": 1},
-            return_document=ReturnDocument.BEFORE,
-        )
+        try:
+            previous = self._collection.find_one_and_update(
+                {"_id": run_id},
+                [{"$set": fields_to_update}],
+                projection={"_id": 0, "lifecycle_stage": 1},
+                return_document=ReturnDocument.BEFORE,
+            )
+        except (PyMongoError, BSONError) as exc:
+            raise RepositoryPersistenceError("Database operation 'log_inputs' failed.") from exc
         if previous is None:
-            raise RunNotFoundError(run_id)
+            raise RepositoryNotFoundError(run_id)
         if previous["lifecycle_stage"] != "active":
-            raise RunInactiveError(run_id, previous["lifecycle_stage"])
+            raise RepositoryNotActiveError(run_id, previous["lifecycle_stage"])
 
     def log_outputs(self, *, run_id: str, models: list[dict]) -> None:
         """Append model outputs, preserving submission order and duplicates."""
@@ -225,16 +263,19 @@ class RunRepository:
         fields_to_update = {
             "outputs": {"$cond": [{"$eq": ["$lifecycle_stage", "active"]}, outputs, "$outputs"]}
         }
-        previous = self._collection.find_one_and_update(
-            {"_id": run_id},
-            [{"$set": fields_to_update}],
-            projection={"_id": 0, "lifecycle_stage": 1},
-            return_document=ReturnDocument.BEFORE,
-        )
+        try:
+            previous = self._collection.find_one_and_update(
+                {"_id": run_id},
+                [{"$set": fields_to_update}],
+                projection={"_id": 0, "lifecycle_stage": 1},
+                return_document=ReturnDocument.BEFORE,
+            )
+        except (PyMongoError, BSONError) as exc:
+            raise RepositoryPersistenceError("Database operation 'log_outputs' failed.") from exc
         if previous is None:
-            raise RunNotFoundError(run_id)
+            raise RepositoryNotFoundError(run_id)
         if previous["lifecycle_stage"] != "active":
-            raise RunInactiveError(run_id, previous["lifecycle_stage"])
+            raise RepositoryNotActiveError(run_id, previous["lifecycle_stage"])
 
     @staticmethod
     def _append_inputs_expression(field: str, inputs: list[dict], identity: tuple[str, ...]):
@@ -329,5 +370,5 @@ class RunRepository:
             return_document=ReturnDocument.AFTER,
         )
         if document is None:
-            raise RunNotFoundError(run_id)
+            raise RepositoryNotFoundError(run_id)
         return RunRecord.from_document(document)

@@ -4,7 +4,6 @@ import logging
 from functools import cached_property
 from uuid import uuid4
 
-from bson.errors import BSONError
 from mlflow.entities import (
     Dataset,
     DatasetInput,
@@ -68,6 +67,7 @@ from mlflow_mongodb.tracking.errors import (
     RepositoryAlreadyExistsError,
     RepositoryNotActiveError,
     RepositoryNotFoundError,
+    RepositoryParamConflictError,
     RepositoryPersistenceError,
 )
 from mlflow_mongodb.tracking.repositories import (
@@ -363,7 +363,11 @@ class MongoDBTrackingStore(AbstractStore):
         run_name: str | None,
     ) -> Run:
         experiment_id = None if experiment_id is None else str(experiment_id)
-        experiment = self._experiment_repository.find_by_id(experiment_id)
+        try:
+            experiment = self._experiment_repository.find_by_id(experiment_id)
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to create run: %s", exc)
+            raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
         if experiment is None:
             raise MlflowException(
                 f"No Experiment with id={experiment_id} exists", RESOURCE_DOES_NOT_EXIST
@@ -403,10 +407,14 @@ class MongoDBTrackingStore(AbstractStore):
                 lifecycle_stage=LifecycleStage.ACTIVE,
                 tags={tag.key: tag.value for tag in run_tags},
             )
-        except RunAlreadyExistsError as exc:
+        except RepositoryAlreadyExistsError as exc:
+            logger.error("Unable to create run: %s", exc)
             raise MlflowException(
                 f"Run with id={run_id} already exists", RESOURCE_ALREADY_EXISTS
-            ) from exc
+            ) from None
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to create run: %s", exc)
+            raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
 
         return Run(
             RunInfo(
@@ -425,7 +433,11 @@ class MongoDBTrackingStore(AbstractStore):
         )
 
     def get_run(self, run_id: str) -> Run:
-        record = self._run_repository.find_by_id(run_id)
+        try:
+            record = self._run_repository.find_by_id(run_id)
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to get run: %s", exc)
+            raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
         if record is None:
             raise MlflowException(f"Run with id={run_id} not found", RESOURCE_DOES_NOT_EXIST)
 
@@ -487,18 +499,26 @@ class MongoDBTrackingStore(AbstractStore):
                 run_id=run_id,
                 deleted_time=get_current_time_millis(),
             )
-        except RunNotFoundError as exc:
+        except RepositoryNotFoundError as exc:
+            logger.error("Unable to delete run: %s", exc)
             raise MlflowException(
                 f"Run with id={run_id} not found", RESOURCE_DOES_NOT_EXIST
-            ) from exc
+            ) from None
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to delete run: %s", exc)
+            raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
 
     def restore_run(self, run_id: str) -> None:
         try:
             self._run_repository.restore(run_id=run_id)
-        except RunNotFoundError as exc:
+        except RepositoryNotFoundError as exc:
+            logger.error("Unable to restore run: %s", exc)
             raise MlflowException(
                 f"Run with id={run_id} not found", RESOURCE_DOES_NOT_EXIST
-            ) from exc
+            ) from None
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to restore run: %s", exc)
+            raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
 
     def update_run_info(
         self,
@@ -507,7 +527,11 @@ class MongoDBTrackingStore(AbstractStore):
         end_time: int | None,
         run_name: str | None,
     ) -> RunInfo:
-        run = self._run_repository.find_by_id(run_id)
+        try:
+            run = self._run_repository.find_by_id(run_id)
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to update run info: %s", exc)
+            raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
         if run is None:
             raise MlflowException(f"Run with id={run_id} not found", RESOURCE_DOES_NOT_EXIST)
         if run.lifecycle_stage != LifecycleStage.ACTIVE:
@@ -527,10 +551,14 @@ class MongoDBTrackingStore(AbstractStore):
                 end_time=end_time,
                 run_name=run_name,
             )
-        except RunNotFoundError as exc:
+        except RepositoryNotFoundError as exc:
+            logger.error("Unable to update run info: %s", exc)
             raise MlflowException(
                 f"Run with id={run_id} not found", RESOURCE_DOES_NOT_EXIST
-            ) from exc
+            ) from None
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to update run info: %s", exc)
+            raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
 
         return RunInfo(
             run_id=updated.run_id,
@@ -570,18 +598,23 @@ class MongoDBTrackingStore(AbstractStore):
                 params=[{"key": param.key, "value": param.value} for param in params],
                 tags=[{"key": tag.key, "value": tag.value} for tag in tags],
             )
-        except RunParamConflictError as exc:
+        except RepositoryParamConflictError as exc:
+            logger.error("Unable to log run batch: %s", exc)
             key, old_value, new_value, conflicting_run_id = exc.args
             raise MlflowException(
                 f"Changing param values is not allowed. Param with key='{key}' was already logged "
                 f"with value='{old_value}' for run ID='{conflicting_run_id}'. Attempted logging "
                 f"new value '{new_value}'.",
                 INVALID_PARAMETER_VALUE,
-            ) from exc
-        except RunNotFoundError as exc:
+            ) from None
+        except RepositoryNotFoundError as exc:
+            logger.error("Unable to log run batch: %s", exc)
             raise MlflowException(
                 f"Run with id={run_id} not found", RESOURCE_DOES_NOT_EXIST
-            ) from exc
+            ) from None
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to log run batch: %s", exc)
+            raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
 
     def log_inputs(
         self,
@@ -607,19 +640,21 @@ class MongoDBTrackingStore(AbstractStore):
             self._run_repository.log_inputs(
                 run_id=run_id, datasets=dataset_inputs, models=model_inputs
             )
-        except RunNotFoundError as exc:
+        except RepositoryNotFoundError as exc:
+            logger.error("Unable to log run inputs: %s", exc)
             raise MlflowException(
                 f"Run with id={run_id} not found", RESOURCE_DOES_NOT_EXIST
-            ) from exc
-        except RunInactiveError as exc:
+            ) from None
+        except RepositoryNotActiveError as exc:
+            logger.error("Unable to log run inputs: %s", exc)
             _, lifecycle_stage = exc.args
             raise MlflowException(
                 f"The run {run_id} must be in the 'active' state. "
                 f"Current state is {lifecycle_stage}.",
                 INVALID_PARAMETER_VALUE,
-            ) from exc
-        except PyMongoError:
-            logger.exception("Unable to log run inputs")
+            ) from None
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to log run inputs: %s", exc)
             raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
 
     def log_outputs(self, run_id: str, models: list[LoggedModelOutput]) -> None:
@@ -627,19 +662,21 @@ class MongoDBTrackingStore(AbstractStore):
         model_outputs = [{"model_id": model.model_id, "step": model.step} for model in models]
         try:
             self._run_repository.log_outputs(run_id=run_id, models=model_outputs)
-        except RunNotFoundError as exc:
+        except RepositoryNotFoundError as exc:
+            logger.error("Unable to log run outputs: %s", exc)
             raise MlflowException(
                 f"Run with id={run_id} not found", RESOURCE_DOES_NOT_EXIST
-            ) from exc
-        except RunInactiveError as exc:
+            ) from None
+        except RepositoryNotActiveError as exc:
+            logger.error("Unable to log run outputs: %s", exc)
             _, lifecycle_stage = exc.args
             raise MlflowException(
                 f"The run {run_id} must be in the 'active' state. "
                 f"Current state is {lifecycle_stage}.",
                 INVALID_PARAMETER_VALUE,
-            ) from exc
-        except PyMongoError:
-            logger.exception("Unable to log run outputs")
+            ) from None
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to log run outputs: %s", exc)
             raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
 
     def get_metric_history(
@@ -668,8 +705,8 @@ class MongoDBTrackingStore(AbstractStore):
                 offset=offset,
                 limit=max_results + 1 if max_results is not None else None,
             )
-        except PyMongoError:
-            logger.exception("Unable to read metric history")
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to read metric history: %s", exc)
             raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
 
         next_token = None
