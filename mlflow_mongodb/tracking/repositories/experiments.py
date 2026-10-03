@@ -13,10 +13,10 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 from mlflow_mongodb.tracking.errors import (
-    ExperimentAlreadyExistsError,
-    ExperimentNotActiveError,
-    ExperimentNotFoundError,
-    ExperimentPersistenceError,
+    RepositoryAlreadyExistsError,
+    RepositoryNotActiveError,
+    RepositoryNotFoundError,
+    RepositoryPersistenceError,
 )
 from mlflow_mongodb.tracking.types import ExperimentRecord
 
@@ -64,7 +64,7 @@ class ExperimentRepository:
                 name="experiments_lifecycle_creation_id",
             )
         except (PyMongoError, BSONError) as exc:
-            raise ExperimentPersistenceError("A database operation failed.") from exc
+            raise RepositoryPersistenceError("A database operation failed.") from exc
 
     def search(
         self,
@@ -113,7 +113,7 @@ class ExperimentRepository:
             )
             return [ExperimentRecord.from_document(document) for document in cursor]
         except (PyMongoError, BSONError) as exc:
-            raise ExperimentPersistenceError("A database operation failed.") from exc
+            raise RepositoryPersistenceError("A database operation failed.") from exc
 
     @classmethod
     def _value_condition(
@@ -154,10 +154,10 @@ class ExperimentRepository:
         except DuplicateKeyError as exc:
             # Do not report an ID collision as a duplicate experiment name.
             if exc.details and exc.details.get("keyPattern") == {"_id": 1}:
-                raise ExperimentPersistenceError("Unable to create experiment.") from exc
-            raise ExperimentAlreadyExistsError(name) from exc
+                raise RepositoryPersistenceError("Unable to create experiment.") from exc
+            raise RepositoryAlreadyExistsError(name) from exc
         except (PyMongoError, BSONError) as exc:
-            raise ExperimentPersistenceError("Unable to create experiment.") from exc
+            raise RepositoryPersistenceError("Unable to create experiment.") from exc
         return experiment_id
 
     def find_by_id(self, experiment_id: str) -> ExperimentRecord | None:
@@ -184,13 +184,13 @@ class ExperimentRepository:
             )
             if document is None:
                 if self.find_by_id(experiment_id) is None:
-                    raise ExperimentNotFoundError(experiment_id)
-                raise ExperimentNotActiveError(experiment_id)
+                    raise RepositoryNotFoundError(experiment_id)
+                raise RepositoryNotActiveError(experiment_id)
             return ExperimentRecord.from_document(document)
         except DuplicateKeyError as exc:
-            raise ExperimentAlreadyExistsError(new_name) from exc
+            raise RepositoryAlreadyExistsError(new_name) from exc
         except (PyMongoError, BSONError) as exc:
-            raise ExperimentPersistenceError("Unable to rename experiment.") from exc
+            raise RepositoryPersistenceError("Unable to rename experiment.") from exc
 
     def mark_deleted(
         self,
@@ -233,5 +233,5 @@ class ExperimentRepository:
             return_document=ReturnDocument.AFTER,
         )
         if document is None:
-            raise ExperimentNotFoundError(experiment_id)
+            raise RepositoryNotFoundError(experiment_id)
         return ExperimentRecord.from_document(document)

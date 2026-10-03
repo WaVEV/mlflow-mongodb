@@ -31,10 +31,10 @@ from pymongo.errors import ConfigurationError
 
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 from mlflow_mongodb.tracking.errors import (
-    ExperimentAlreadyExistsError,
-    ExperimentNotActiveError,
-    ExperimentNotFoundError,
-    ExperimentPersistenceError,
+    RepositoryAlreadyExistsError,
+    RepositoryNotActiveError,
+    RepositoryNotFoundError,
+    RepositoryPersistenceError,
 )
 from mlflow_mongodb.tracking.repositories import ExperimentRepository
 from mlflow_mongodb.tracking.repositories.experiments import ExperimentFilter, ExperimentOrder
@@ -59,8 +59,8 @@ class MongoDBTrackingStore(AbstractStore):
             )
         try:
             return MongoClient(self.store_uri)
-        except ConfigurationError:
-            logger.exception("Unable to create MongoDB tracking client")
+        except ConfigurationError as exc:
+            logger.error("Unable to create MongoDB tracking client: %s", exc)
             raise MlflowException(
                 "Invalid MongoDB tracking URI.", error_code=INVALID_PARAMETER_VALUE
             ) from None
@@ -69,8 +69,8 @@ class MongoDBTrackingStore(AbstractStore):
     def _database(self) -> Database:
         try:
             return self._mongo_client.get_default_database()
-        except ConfigurationError:
-            logger.exception("Unable to select the MongoDB tracking database")
+        except ConfigurationError as exc:
+            logger.error("Unable to select the MongoDB tracking database: %s", exc)
             raise MlflowException(
                 "The MongoDB tracking URI must include a database name.",
                 error_code=INVALID_PARAMETER_VALUE,
@@ -114,8 +114,8 @@ class MongoDBTrackingStore(AbstractStore):
                 offset=offset,
                 limit=max_results + 1,
             )
-        except ExperimentPersistenceError:
-            logger.exception("Unable to search experiments")
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to search experiments: %s", exc)
             raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
 
         next_page_token = None
@@ -199,12 +199,12 @@ class MongoDBTrackingStore(AbstractStore):
                 creation_timestamp=get_current_time_millis(),
                 tags=tags_by_key,
             )
-        except ExperimentAlreadyExistsError as exc:
+        except RepositoryAlreadyExistsError as exc:
             logger.error("Unable to create experiment: %s", exc)
             raise MlflowException(
                 f"Experiment(name={name}) already exists.", RESOURCE_ALREADY_EXISTS
             ) from None
-        except ExperimentPersistenceError as exc:
+        except RepositoryPersistenceError as exc:
             logger.error("Unable to create experiment: %s", exc)
             raise MlflowException("Unable to create experiment.", INTERNAL_ERROR) from None
 
@@ -248,7 +248,7 @@ class MongoDBTrackingStore(AbstractStore):
                 experiment_id=experiment_id,
                 last_update_time=get_current_time_millis(),
             )
-        except ExperimentNotFoundError as exc:
+        except RepositoryNotFoundError as exc:
             logger.error("Unable to delete experiment: %s", exc)
             raise MlflowException(
                 f"No Experiment with id={experiment_id} exists", RESOURCE_DOES_NOT_EXIST
@@ -260,7 +260,7 @@ class MongoDBTrackingStore(AbstractStore):
                 experiment_id=experiment_id,
                 last_update_time=get_current_time_millis(),
             )
-        except ExperimentNotFoundError as exc:
+        except RepositoryNotFoundError as exc:
             logger.error("Unable to restore experiment: %s", exc)
             raise MlflowException(
                 f"No Experiment with id={experiment_id} exists", RESOURCE_DOES_NOT_EXIST
@@ -275,19 +275,19 @@ class MongoDBTrackingStore(AbstractStore):
                 new_name=new_name,
                 last_update_time=get_current_time_millis(),
             )
-        except ExperimentNotFoundError:
-            logger.exception("Unable to rename experiment: experiment not found")
+        except RepositoryNotFoundError as exc:
+            logger.error("Unable to rename experiment: %s", exc)
             raise MlflowException(
                 f"No Experiment with id={experiment_id} exists", RESOURCE_DOES_NOT_EXIST
             ) from None
-        except ExperimentNotActiveError:
-            logger.exception("Unable to rename experiment: experiment is not active")
+        except RepositoryNotActiveError as exc:
+            logger.error("Unable to rename experiment: %s", exc)
             raise MlflowException("Cannot rename a non-active experiment.", INVALID_STATE) from None
-        except ExperimentAlreadyExistsError:
-            logger.exception("Unable to rename experiment: name already exists")
+        except RepositoryAlreadyExistsError as exc:
+            logger.error("Unable to rename experiment: %s", exc)
             raise MlflowException(
                 f"Experiment(name={new_name}) already exists.", RESOURCE_ALREADY_EXISTS
             ) from None
-        except ExperimentPersistenceError:
-            logger.exception("Unable to rename experiment")
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to rename experiment: %s", exc)
             raise MlflowException("Unable to rename experiment.", INTERNAL_ERROR) from None

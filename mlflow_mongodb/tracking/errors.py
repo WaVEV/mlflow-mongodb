@@ -1,17 +1,17 @@
-"""Experiment exceptions raised by the tracking store and repository."""
+"""Tracking domain exceptions and repository persistence errors."""
 
 
-class ExperimentPersistenceError(Exception):
-    """Raised when an experiment repository database operation fails."""
+class RepositoryPersistenceError(Exception):
+    """Raised when a repository database operation fails."""
 
 
-class ExperimentAlreadyExistsError(Exception):
-    """Raised when an experiment name is already stored."""
+class RepositoryAlreadyExistsError(Exception):
+    """Raised when a resource with the requested unique identity already exists."""
 
 
-class ExperimentNotFoundError(Exception):
-    """Raised when an experiment is not stored in the expected lifecycle stage."""
+class RepositoryNotFoundError(Exception):
+    """Raised when a resource is not stored in the expected lifecycle stage."""
 
 
-class ExperimentNotActiveError(Exception):
-    """Raised when a rename targets a non-active experiment."""
+class RepositoryNotActiveError(Exception):
+    """Raised when an operation requires an active resource."""
