@@ -1,15 +1,15 @@
 """Skeleton of the MongoDB tracking store for the agreed V1 scope."""
 
-import logging
-from functools import cached_property
-from uuid import uuid4
-import json
 import asyncio
 import binascii
+import json
+import logging
 import math
 import re
 from collections import defaultdict
+from functools import cached_property
 from typing import Any
+from uuid import uuid4
 
 from mlflow.entities import (
     Assessment,
@@ -38,21 +38,6 @@ from mlflow.entities import (
     TraceState,
     ViewType,
 )
-from mlflow.exceptions import MlflowException
-from mlflow.protos.databricks_pb2 import (
-    INTERNAL_ERROR,
-    INVALID_PARAMETER_VALUE,
-    INVALID_STATE,
-    RESOURCE_ALREADY_EXISTS,
-    RESOURCE_DOES_NOT_EXIST,
-)
-from mlflow.store.entities.paged_list import PagedList
-from mlflow.store.tracking import (
-    SEARCH_MAX_RESULTS_DEFAULT,
-    SEARCH_MAX_RESULTS_THRESHOLD,
-)
-from mlflow.store.tracking.abstract_store import AbstractStore
-
 from mlflow.entities.logged_model_parameter import LoggedModelParameter
 from mlflow.entities.logged_model_status import LoggedModelStatus
 from mlflow.entities.logged_model_tag import LoggedModelTag
@@ -64,15 +49,25 @@ from mlflow.entities.trace_metrics import (
     MetricDataPoint,
     MetricViewType,
 )
+from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import (
     BAD_REQUEST,
+    INTERNAL_ERROR,
+    INVALID_PARAMETER_VALUE,
+    INVALID_STATE,
+    RESOURCE_ALREADY_EXISTS,
+    RESOURCE_DOES_NOT_EXIST,
     TEMPORARILY_UNAVAILABLE,
 )
+from mlflow.store.entities.paged_list import PagedList
 from mlflow.store.tracking import (
     MAX_RESULTS_QUERY_TRACE_METRICS,
     SEARCH_LOGGED_MODEL_MAX_RESULTS_DEFAULT,
+    SEARCH_MAX_RESULTS_DEFAULT,
+    SEARCH_MAX_RESULTS_THRESHOLD,
     SEARCH_TRACES_DEFAULT_MAX_RESULTS,
 )
+from mlflow.store.tracking.abstract_store import AbstractStore
 from mlflow.tracing.constant import (
     TRACE_REQUEST_RESPONSE_PREVIEW_MAX_LENGTH_OSS,
     GenAiSemconvKey,
@@ -82,7 +77,6 @@ from mlflow.tracing.constant import (
     TraceSizeStatsKey,
     TraceTagKey,
 )
-
 from mlflow.tracing.otel.translation import translate_span_when_storing
 from mlflow.tracing.utils import (
     SpanAggregationNode,
@@ -91,7 +85,6 @@ from mlflow.tracing.utils import (
     try_json_loads,
 )
 from mlflow.tracing.utils.truncation import _get_truncated_preview
-
 from mlflow.utils.mlflow_tags import MLFLOW_RUN_NAME, _get_run_name_from_tags
 from mlflow.utils.name_utils import _generate_random_name
 from mlflow.utils.search_utils import (
@@ -112,10 +105,10 @@ from mlflow.utils.validation import (
     _validate_experiment_artifact_location_length,
     _validate_experiment_name,
     _validate_experiment_tag,
+    _validate_logged_model_name,
     _validate_metric_name,
     _validate_param_keys_unique,
     _validate_run_id,
-    _validate_logged_model_name,
     _validate_trace_tag,
 )
 from pymongo import MongoClient
@@ -132,6 +125,7 @@ from mlflow_mongodb.infrastructure.search_filters import (
     SearchFilterValidator,
 )
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
+from mlflow_mongodb.tracking._retry import retry_on_exception
 from mlflow_mongodb.tracking.errors import (
     RepositoryAlreadyExistsError,
     RepositoryDocumentTooLargeError,
@@ -149,7 +143,6 @@ from mlflow_mongodb.tracking.repositories import (
     RunRepository,
 )
 from mlflow_mongodb.tracking.repositories.experiments import ExperimentFilter, ExperimentOrder
-from mlflow_mongodb.tracking._retry import retry_on_exception
 from mlflow_mongodb.tracking.repositories.logged_models import LoggedModelFilter, LoggedModelOrder
 from mlflow_mongodb.tracking.repositories.traces import (
     TraceRepository,
@@ -171,6 +164,7 @@ except ImportError:
     SearchEvaluationDatasetsUtils = None
 
 logger = logging.getLogger(__name__)
+
 
 class _TraceNotFullyExportedError(Exception):
     """Raised while a trace's expected spans are still being persisted."""
@@ -1246,7 +1240,7 @@ class MongoDBTrackingStore(AbstractStore):
             if value is not None:
                 metadata[key] = str(cls._span_attribute_value(value))
 
-        document = {
+        return {
             "trace_id": span.trace_id,
             "span_id": span.span_id,
             "parent_span_id": span.parent_id,
@@ -1280,7 +1274,6 @@ class MongoDBTrackingStore(AbstractStore):
                 else None,
             },
         }
-        return document
 
     @staticmethod
     def _summarize_spans(documents: list[SpanSummaryRecord]) -> dict[str, Any]:
@@ -1462,6 +1455,7 @@ class MongoDBTrackingStore(AbstractStore):
         model_id: str | None = None,  # ruff: ignore[unused-method-argument]
         locations: list[str] | None = None,
     ) -> tuple[list[TraceInfo], str | None]:
+        # TODO: REFACTOR THIS.
         locations = _resolve_experiment_ids_and_locations(experiment_ids, locations)
         if (
             isinstance(max_results, bool)
@@ -2127,7 +2121,22 @@ class MongoDBTrackingStore(AbstractStore):
             raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
 
     def link_traces_to_run(self, trace_ids: list[str], run_id: str) -> None:
-        raise NotImplementedError
+        """Add an idempotent run association to at most 100 traces per request."""
+        if not trace_ids:
+            return
+        if not run_id:
+            raise MlflowException.invalid_parameter_value("run_id cannot be empty")
+        if len(trace_ids) > 100:
+            raise MlflowException.invalid_parameter_value(
+                "Cannot link more than 100 traces to a run in a single request. "
+                f"Provided {len(trace_ids)} traces."
+            )
+
+        try:
+            self._trace_repository.link_traces_to_run(trace_ids=trace_ids, run_id=run_id)
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to link traces to run: %s", exc)
+            raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
 
     def unlink_traces_from_run(self, trace_ids: list[str], run_id: str) -> None:
         raise NotImplementedError

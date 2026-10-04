@@ -53,8 +53,8 @@ from mlflow_mongodb.tracking._retry import retry_on_exception
 from mlflow_mongodb.tracking.errors import (
     RepositoryDocumentTooLargeError,
     RepositoryInvalidDocumentError,
-    RepositoryPersistenceError,
     RepositoryNotFoundError,
+    RepositoryPersistenceError,
     RepositoryWriteConflictError,
 )
 from mlflow_mongodb.tracking.types import SpanRecord, SpanSummaryRecord, TraceRecord
@@ -857,6 +857,20 @@ class TraceRepository:
             ) from exc
         if document is None:
             raise RepositoryNotFoundError(trace_id)
+
+    def link_traces_to_run(self, *, trace_ids: list[str], run_id: str) -> None:
+        """Add a run reference to existing traces without duplicate entries."""
+        if not trace_ids:
+            return
+
+        query = {"_id": {"$in": trace_ids}}
+        update = {"$addToSet": {"run_ids": run_id}}
+        try:
+            self._collection.update_many(query, update)
+        except (PyMongoError, BSONError) as exc:
+            raise RepositoryPersistenceError(
+                "Database operation 'link_traces_to_run' failed."
+            ) from exc
 
     def link_prompts(self, *, trace_id: str, prompt_versions: list[Mapping[str, str]]) -> None:
         """Add prompt-version references to a trace without duplicate entries."""
