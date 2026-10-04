@@ -1,6 +1,5 @@
 """Persistence operations for traces, spans, and assessments."""
 
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -32,7 +31,7 @@ from mlflow.tracing.constant import (
     TraceMetricSearchKey,
     TraceTagKey,
 )
-from mlflow.utils.search_utils import SearchTraceMetricsUtils, SearchUtils
+from mlflow.utils.search_utils import SearchTraceMetricsUtils
 from pymongo import ASCENDING, DESCENDING, ReplaceOne, ReturnDocument, UpdateOne
 from pymongo.database import Database
 from pymongo.errors import (
@@ -43,11 +42,12 @@ from pymongo.errors import (
     PyMongoError,
 )
 
-from mlflow_mongodb.infrastructure._array_updates import (
+from mlflow_mongodb.infrastructure.array_operations import (
     build_array_value_expression,
     build_merge_array_expression,
     build_remove_array_element_update,
 )
+from mlflow_mongodb.infrastructure.search_conditions import COMPARISON_OPERATORS, like_regex
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 from mlflow_mongodb.tracking._retry import retry_on_exception
 from mlflow_mongodb.tracking.errors import (
@@ -79,14 +79,6 @@ class TraceRepository:
     """Own trace metadata and the separate span and assessment collections."""
 
     _READ_BATCH_SIZE = 500
-    COMPARISON_OPERATORS: ClassVar[dict[str, str]] = {
-        "=": "$eq",
-        "!=": "$ne",
-        "<": "$lt",
-        "<=": "$lte",
-        ">": "$gt",
-        ">=": "$gte",
-    }
     SEARCH_ATTRIBUTE_FIELDS: ClassVar[dict[str, str]] = {
         "request_id": "_id",
         "experiment_id": "experiment_id",
@@ -472,35 +464,48 @@ class TraceRepository:
         for key in ("request_preview", "response_preview"):
             fields[key] = {"$ifNull": [f"${key}", {"$literal": summary[key]}]}
 
-        aggregate_records = []
+        metadata_updates = []
         for field, metadata_key in (
             ("token_usage", TraceMetadataKey.TOKEN_USAGE),
             ("cost", TraceMetadataKey.COST),
         ):
             if summary[field] is not None:
+                is_authoritative = {
+                    "$in": [metadata_key, {"$ifNull": ["$authoritative_metadata_keys", []]}]
+                }
                 fields[field] = {
                     "$cond": [
-                        {"$in": [metadata_key, {"$ifNull": ["$authoritative_metadata_keys", []]}]},
+                        is_authoritative,
                         f"${field}",
                         {"$literal": summary[field]},
                     ]
                 }
-                aggregate_records.append(
+                metadata_updates.append(
                     {
-                        "k": metadata_key,
-                        "v": summary["aggregate_metadata"][metadata_key],
+                        "$set": {
+                            "trace_metadata": {
+                                "$cond": [
+                                    is_authoritative,
+                                    "$trace_metadata",
+                                    build_merge_array_expression(
+                                        "$trace_metadata",
+                                        [
+                                            {
+                                                "k": metadata_key,
+                                                "v": summary["aggregate_metadata"][metadata_key],
+                                            }
+                                        ],
+                                        "k",
+                                    ),
+                                ]
+                            }
+                        }
                     }
                 )
-        metadata_update = build_merge_array_expression(
-            "$trace_metadata",
-            aggregate_records,
-            "k",
-            protected_keys="$authoritative_metadata_keys",
-        )
         try:
             result = self._collection.update_one(
                 {"_id": trace_id, "experiment_id": experiment_id, "span_revision": revision},
-                [{"$set": fields}, {"$set": {"trace_metadata": metadata_update}}],
+                [{"$set": fields}, *metadata_updates],
             )
         except (PyMongoError, BSONError) as exc:
             raise RepositoryPersistenceError(
@@ -509,14 +514,22 @@ class TraceRepository:
         if not result.matched_count:
             raise RepositoryWriteConflictError(trace_id)
 
-    @classmethod
-    def _merge_missing_records(cls, field: str, values: Mapping[str, str]) -> dict:
-        return build_merge_array_expression(
-            field,
-            [{"k": k, "v": v} for k, v in values.items()],
-            "k",
-            protected_keys=f"{field}.k",
-        )
+    @staticmethod
+    def _merge_missing_records(field: str, values: Mapping[str, str]) -> dict:
+        return {
+            "$concatArrays": [
+                {"$ifNull": [field, []]},
+                {
+                    "$filter": {
+                        "input": {"$literal": [{"k": k, "v": v} for k, v in values.items()]},
+                        "as": "record",
+                        "cond": {
+                            "$not": [{"$in": ["$$record.k", {"$ifNull": [f"{field}.k", []]}]}]
+                        },
+                    }
+                },
+            ]
+        }
 
     def get_trace_info(self, trace_id: str) -> TraceRecord:
         try:
@@ -584,19 +597,15 @@ class TraceRepository:
         trace_ids = [document["_id"] for document in documents]
         return self.batch_get_trace_infos(trace_ids, experiment_ids=experiment_ids)
 
-    @classmethod
-    def _search_value_condition(cls, operator: str, value: Any) -> dict[str, Any]:
-        if operator in (SearchUtils.LIKE_OPERATOR, SearchUtils.ILIKE_OPERATOR):
-            pattern = re.escape(value).replace("%", ".*").replace("_", ".")
-            return {
-                "$regex": f"\\A{pattern}\\z",
-                "$options": "is" if operator == SearchUtils.ILIKE_OPERATOR else "s",
-            }
+    @staticmethod
+    def _search_value_condition(operator: str, value: Any) -> dict[str, Any]:
+        if operator in ("LIKE", "ILIKE"):
+            return {"$regex": like_regex(value, operator)}
         if operator == "RLIKE":
             return {"$regex": value}
         if operator in ("IN", "NOT IN"):
             return {"$in" if operator == "IN" else "$nin": list(value)}
-        return {cls.COMPARISON_OPERATORS[operator]: value}
+        return {COMPARISON_OPERATORS[operator]: value}
 
     @classmethod
     def _search_filter_condition(cls, item: TraceSearchFilter) -> dict[str, Any]:
@@ -605,7 +614,7 @@ class TraceRepository:
                 expression = {"$add": ["$request_time", {"$ifNull": ["$execution_duration", 0]}]}
                 return {
                     "$expr": {
-                        cls.COMPARISON_OPERATORS[item.operator]: [
+                        COMPARISON_OPERATORS[item.operator]: [
                             expression,
                             {"$literal": item.value},
                         ]

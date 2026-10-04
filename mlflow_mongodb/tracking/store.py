@@ -5,7 +5,6 @@ import binascii
 import json
 import logging
 import math
-import re
 from collections import defaultdict
 from functools import cached_property
 from typing import Any
@@ -116,16 +115,22 @@ from pymongo.database import Database
 from pymongo.errors import ConfigurationError
 
 from mlflow_mongodb.infrastructure.errors import (
+    RepositoryEmptySearchKeyError,
     RepositoryInvalidAttributeError,
+    RepositoryInvalidFilterValueError,
+    RepositoryInvalidPromptFilterError,
+    RepositoryInvalidRegexError,
     RepositoryUnsupportedComparatorError,
     RepositoryUnsupportedFieldTypeError,
 )
 from mlflow_mongodb.infrastructure.search_filters import (
     ConfiguredSearchFilterValidator,
+    SearchFilterClause,
     SearchFilterValidator,
 )
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 from mlflow_mongodb.tracking._retry import retry_on_exception
+from mlflow_mongodb.tracking._search_filters import _SearchTrackingFilterValidator
 from mlflow_mongodb.tracking.errors import (
     RepositoryAlreadyExistsError,
     RepositoryDocumentTooLargeError,
@@ -164,6 +169,45 @@ except ImportError:
     SearchEvaluationDatasetsUtils = None
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_logged_model_search_key(key: str) -> str:
+    # The SQL-backed MLflow parser emits these names for timestamp aliases.
+    if key in ("creation_timestamp_ms", "last_updated_timestamp_ms"):
+        return key.removesuffix("_ms")
+    return key
+
+
+def _stored_logged_model_attribute_key(key: str) -> str:
+    if key == "creation_time":
+        return "creation_timestamp"
+    if key == "last_updated_time":
+        return "last_updated_timestamp"
+    return key
+
+
+def _is_numeric_logged_model_filter(clause: SearchFilterClause) -> bool:
+    # Preserve classification after the existing attribute-to-storage key translation.
+    return clause.field_type == "metric" or (
+        clause.field_type == "attribute"
+        and _stored_logged_model_attribute_key(clause.key)
+        in SearchLoggedModelsUtils.NUMERIC_ATTRIBUTES
+    )
+
+
+def _validate_logged_model_filter_value(clause: SearchFilterClause) -> None:
+    if not clause.key:
+        raise RepositoryEmptySearchKeyError("Search key must not be empty.")
+    if _is_numeric_logged_model_filter(clause):
+        if not isinstance(clause.value, (int, float)) or not math.isfinite(clause.value):
+            raise RepositoryInvalidFilterValueError("finite numbers")
+    elif clause.comparator in ("IN", "NOT IN"):
+        if not isinstance(clause.value, (list, tuple)) or not all(
+            isinstance(value, str) for value in clause.value
+        ):
+            raise RepositoryInvalidFilterValueError("a list of string values")
+    elif not isinstance(clause.value, str):
+        raise RepositoryInvalidFilterValueError("string values")
 
 
 class _TraceNotFullyExportedError(Exception):
@@ -1445,6 +1489,69 @@ class MongoDBTrackingStore(AbstractStore):
             logger.error("Unable to delete trace tag: %s", exc)
             raise MlflowException("A database operation failed.", INTERNAL_ERROR) from None
 
+    @cached_property
+    def _trace_filter_validator(self) -> _SearchTrackingFilterValidator:
+        return _SearchTrackingFilterValidator(
+            field_types=("attribute", "tag", "request_metadata"),
+            # MLflow resolves aliases before validation (name/prompt/run_id become tags/metadata).
+            attribute_keys=SearchTraceUtils.VALID_SEARCH_ATTRIBUTE_KEYS,
+            comparators={
+                "attribute": SearchTraceUtils.VALID_STRING_ATTRIBUTE_COMPARATORS,
+                "tag": SearchTraceUtils.VALID_TAG_COMPARATORS,
+                "request_metadata": SearchTraceUtils.VALID_METADATA_COMPARATORS,
+            },
+            field_comparators={
+                ("attribute", key): SearchTraceUtils.VALID_NUMERIC_ATTRIBUTE_COMPARATORS
+                for key in SearchTraceUtils.NUMERIC_ATTRIBUTES
+            },
+            regex_comparators=("RLIKE",),
+        )
+
+    def _parse_trace_filters(self, filter_string: str | None) -> list[TraceSearchFilter]:
+        filters = []
+        for parsed in SearchTraceUtils.parse_search_filter_for_search_traces(filter_string):
+            if parsed["type"] in ("span", "feedback", "expectation", "issue"):
+                continue
+            try:
+                clause = self._trace_filter_validator.validate(parsed)
+            except RepositoryUnsupportedFieldTypeError as exc:
+                logger.error("Unable to validate trace filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid trace search field type: {exc.field_type}"
+                ) from None
+            except RepositoryInvalidAttributeError as exc:
+                logger.error("Unable to validate trace filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid trace search attribute: {exc.key}"
+                ) from None
+            except RepositoryUnsupportedComparatorError as exc:
+                logger.error("Unable to validate trace filter: %s", exc)
+                if exc.field_specific and exc.field_type == "request_metadata":
+                    message = (
+                        f"Comparator '{exc.comparator}' is not supported for reserved metadata "
+                        f"'{exc.key}'. Only '=', '!=', 'IS NULL', and 'IS NOT NULL' are supported."
+                    )
+                else:
+                    message = (
+                        f"Invalid comparator '{exc.comparator}' for trace {exc.field_type} "
+                        f"'{exc.key}'. Supported comparators: {exc.allowed}."
+                    )
+                raise MlflowException.invalid_parameter_value(message) from None
+            except RepositoryInvalidPromptFilterError as exc:
+                logger.error("Unable to validate trace prompt filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    'Prompt filters require `prompt = "name/version"`.'
+                ) from None
+            except RepositoryInvalidRegexError as exc:
+                logger.error("Unable to parse trace filter regular expression: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    "Invalid regular expression in trace filter."
+                ) from None
+            filters.append(
+                TraceSearchFilter(clause.field_type, clause.key, clause.comparator, clause.value)
+            )
+        return filters
+
     def search_traces(
         self,
         experiment_ids: list[str] | None = None,
@@ -1455,7 +1562,6 @@ class MongoDBTrackingStore(AbstractStore):
         model_id: str | None = None,  # ruff: ignore[unused-method-argument]
         locations: list[str] | None = None,
     ) -> tuple[list[TraceInfo], str | None]:
-        # TODO: REFACTOR THIS.
         locations = _resolve_experiment_ids_and_locations(experiment_ids, locations)
         if (
             isinstance(max_results, bool)
@@ -1468,44 +1574,7 @@ class MongoDBTrackingStore(AbstractStore):
                 f"a positive integer at most {SEARCH_MAX_RESULTS_THRESHOLD}",
                 INVALID_PARAMETER_VALUE,
             )
-        filters = []
-        for clause in SearchTraceUtils.parse_search_filter_for_search_traces(filter_string):
-            field_type = clause["type"]
-            if field_type in ("span", "feedback", "expectation", "issue"):
-                continue
-            key = clause["key"]
-            operator = clause["comparator"].upper()
-            value = clause["value"]
-            if SearchTraceUtils.is_attribute(field_type, key, operator):
-                pass
-            elif SearchTraceUtils.is_tag(field_type, operator):
-                if key == TraceTagKey.LINKED_PROMPTS and (operator != "=" or value.count("/") != 1):
-                    raise MlflowException.invalid_parameter_value(
-                        'Prompt filters require `prompt = "name/version"`.'
-                    )
-            elif SearchTraceUtils.is_request_metadata(field_type, operator):
-                if key in (
-                    TraceMetadataKey.TOKEN_USAGE,
-                    TraceMetadataKey.COST,
-                ) and operator not in ("=", "!=", "IS NULL", "IS NOT NULL"):
-                    raise MlflowException.invalid_parameter_value(
-                        f"Comparator '{operator}' is not supported for reserved metadata '{key}'. "
-                        "Only '=', '!=', 'IS NULL', and 'IS NOT NULL' are supported."
-                    )
-            else:
-                raise MlflowException(
-                    f"Invalid trace search field type: {field_type}",
-                    INVALID_PARAMETER_VALUE,
-                )
-            if operator == "RLIKE":
-                try:
-                    re.compile(value)
-                except re.error as exc:
-                    logger.error("Unable to parse trace filter regular expression: %s", exc)
-                    raise MlflowException.invalid_parameter_value(
-                        "Invalid regular expression in trace filter."
-                    ) from None
-            filters.append(TraceSearchFilter(field_type, key, operator, value))
+        filters = self._parse_trace_filters(filter_string)
 
         orders = []
         seen_order_fields = set()
@@ -1722,8 +1791,7 @@ class MongoDBTrackingStore(AbstractStore):
     @staticmethod
     def _logged_model_attribute_key(key: str, *, order_by: bool = False) -> str:
         # MLflow's filter parser emits SQL timestamp names; MongoDB stores entity names.
-        if key in ("creation_timestamp_ms", "last_updated_timestamp_ms"):
-            key = key.removesuffix("_ms")
+        key = _normalize_logged_model_search_key(key)
         valid_keys = (
             SearchLoggedModelsUtils.VALID_ORDER_BY_ATTRIBUTE_KEYS
             if order_by
@@ -1733,11 +1801,7 @@ class MongoDBTrackingStore(AbstractStore):
             raise MlflowException.invalid_parameter_value(
                 f"Invalid logged model attribute: {key!r}."
             )
-        if key == "creation_time":
-            return "creation_timestamp"
-        if key == "last_updated_time":
-            return "last_updated_timestamp"
-        return key
+        return _stored_logged_model_attribute_key(key)
 
     @staticmethod
     def _validate_logged_model_datasets(datasets: list[dict[str, Any]] | None) -> None:
@@ -1760,13 +1824,22 @@ class MongoDBTrackingStore(AbstractStore):
                     "Dataset names and digests must be strings."
                 )
 
-    @classmethod
+    @cached_property
+    def _logged_model_filter_validator(self) -> SearchFilterValidator:
+        # parse_filter_string already validates operators with Entity.validate_op; its rules
+        # differ from SearchLoggedModelsUtils for tag/param membership and timestamp aliases.
+        return ConfiguredSearchFilterValidator(
+            field_types=("attribute", "metric", "param", "tag"),
+            attribute_keys=SearchLoggedModelsUtils.VALID_SEARCH_ATTRIBUTE_KEYS,
+            rules=(_validate_logged_model_filter_value,),
+            uppercase_comparators=False,
+        )
+
     def _parse_logged_model_filters(
-        cls, filter_string: str | None
+        self, filter_string: str | None
     ) -> tuple[LoggedModelFilter, ...]:
         # The parser imports SQL models; defer it until MLflow finishes store discovery.
         from mlflow.utils.search_logged_model_utils import (  # ruff: ignore[import-outside-top-level]
-            EntityType,
             parse_filter_string,
         )
 
@@ -1784,32 +1857,51 @@ class MongoDBTrackingStore(AbstractStore):
         for comparison in comparisons:
             field_type = comparison.entity.type.name.lower()
             key = comparison.entity.key
-            if comparison.entity.type == EntityType.ATTRIBUTE:
-                key = cls._logged_model_attribute_key(key)
-            if not key:
-                raise MlflowException.invalid_parameter_value("Search keys must not be empty.")
-            value = comparison.value
-            if comparison.entity.type == EntityType.METRIC or (
-                comparison.entity.type == EntityType.ATTRIBUTE
-                and key in SearchLoggedModelsUtils.NUMERIC_ATTRIBUTES
-            ):
-                if not isinstance(value, (int, float)) or not math.isfinite(value):
-                    raise MlflowException.invalid_parameter_value(
-                        "Numeric filters require finite numbers."
-                    )
-            elif comparison.op in ("IN", "NOT IN"):
-                if not isinstance(value, (list, tuple)) or not all(
-                    isinstance(v, str) for v in value
-                ):
-                    raise MlflowException.invalid_parameter_value(
-                        "IN and NOT IN require a list of string values."
-                    )
-                value = tuple(value)
-            elif not isinstance(value, str):
+            if field_type == "attribute":
+                key = _normalize_logged_model_search_key(key)
+            parsed = {
+                "type": field_type,
+                "key": key,
+                "comparator": comparison.op,
+                "value": comparison.value,
+            }
+            try:
+                clause = self._logged_model_filter_validator.validate(parsed)
+            except RepositoryUnsupportedFieldTypeError as exc:
+                logger.error("Unable to validate logged model filter: %s", exc)
                 raise MlflowException.invalid_parameter_value(
-                    "String filters require string values."
-                )
-            filters.append(LoggedModelFilter(field_type, key, comparison.op, value))
+                    f"Invalid logged model search field type: {exc.field_type}"
+                ) from None
+            except RepositoryInvalidAttributeError as exc:
+                logger.error("Unable to validate logged model filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid logged model attribute: {exc.key!r}."
+                ) from None
+            except RepositoryEmptySearchKeyError as exc:
+                logger.error("Unable to validate logged model filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    "Search keys must not be empty."
+                ) from None
+            except RepositoryInvalidFilterValueError as exc:
+                logger.error("Unable to validate logged model filter value: %s", exc)
+                messages = {
+                    "finite numbers": "Numeric filters require finite numbers.",
+                    "a list of string values": "IN and NOT IN require a list of string values.",
+                    "string values": "String filters require string values.",
+                }
+                raise MlflowException.invalid_parameter_value(messages[exc.expected]) from None
+
+            key = (
+                _stored_logged_model_attribute_key(clause.key)
+                if clause.field_type == "attribute"
+                else clause.key
+            )
+            value = clause.value
+            if clause.comparator in ("IN", "NOT IN") and not _is_numeric_logged_model_filter(
+                clause
+            ):
+                value = tuple(value)
+            filters.append(LoggedModelFilter(clause.field_type, key, clause.comparator, value))
         return tuple(filters)
 
     @classmethod
@@ -1972,6 +2064,25 @@ class MongoDBTrackingStore(AbstractStore):
             next_token,
         )
 
+    @cached_property
+    def _dataset_filter_validator(self) -> SearchFilterValidator:
+        return ConfiguredSearchFilterValidator(
+            field_types=("attribute", "tag"),
+            attribute_keys=SearchEvaluationDatasetsUtils.VALID_SEARCH_ATTRIBUTE_KEYS,
+            comparators={
+                "attribute": SearchEvaluationDatasetsUtils.VALID_TAG_COMPARATORS,
+                "tag": SearchEvaluationDatasetsUtils.VALID_TAG_COMPARATORS,
+            },
+            field_comparators={
+                (
+                    "attribute",
+                    key,
+                ): SearchEvaluationDatasetsUtils.VALID_NUMERIC_ATTRIBUTE_COMPARATORS
+                for key in SearchEvaluationDatasetsUtils.NUMERIC_ATTRIBUTES
+            },
+            uppercase_comparators=False,
+        )
+
     def search_datasets(
         self,
         experiment_ids: list[str] | None = None,  # ruff: ignore[unused-method-argument]
@@ -1996,22 +2107,24 @@ class MongoDBTrackingStore(AbstractStore):
                 f"`max_results` must be a positive integer at most {SEARCH_MAX_RESULTS_THRESHOLD}."
             )
 
-        for clause in SearchEvaluationDatasetsUtils.parse_search_filter(filter_string):
-            key_type = clause["type"]
-            comparator = clause["comparator"]
-            if (
-                key_type == "attribute"
-                and clause["key"] in SearchEvaluationDatasetsUtils.NUMERIC_ATTRIBUTES
-            ):
-                valid_comparators = (
-                    SearchEvaluationDatasetsUtils.VALID_NUMERIC_ATTRIBUTE_COMPARATORS
-                )
-            else:
-                valid_comparators = SearchEvaluationDatasetsUtils.VALID_TAG_COMPARATORS
-            if comparator not in valid_comparators:
+        for parsed in SearchEvaluationDatasetsUtils.parse_search_filter(filter_string):
+            try:
+                self._dataset_filter_validator.validate(parsed)
+            except RepositoryUnsupportedFieldTypeError as exc:
+                logger.error("Unable to validate evaluation dataset filter: %s", exc)
                 raise MlflowException.invalid_parameter_value(
-                    f"Invalid comparator for evaluation dataset {key_type}: {comparator}"
-                )
+                    f"Invalid evaluation dataset search field type: {exc.field_type}"
+                ) from None
+            except RepositoryInvalidAttributeError as exc:
+                logger.error("Unable to validate evaluation dataset filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid evaluation dataset attribute: {exc.key}"
+                ) from None
+            except RepositoryUnsupportedComparatorError as exc:
+                logger.error("Unable to validate evaluation dataset filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid comparator for evaluation dataset {exc.field_type}: {exc.comparator}"
+                ) from None
 
         for clause in order_by or []:
             key_type, _, _ = (

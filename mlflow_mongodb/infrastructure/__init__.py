@@ -1,1 +1,1 @@
-"""Shared infrastructure for the MongoDB MLflow stores."""
+"""Infrastructure shared by the MongoDB MLflow stores."""
