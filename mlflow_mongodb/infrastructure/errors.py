@@ -1,6 +1,7 @@
 """Shared infrastructure failures translated at the store boundary."""
 
 from collections.abc import Collection
+from typing import Literal
 
 
 class RepositoryAlreadyExistsError(Exception):
@@ -69,3 +70,21 @@ class RepositoryTagNotFoundError(Exception):
 
 class RepositoryWriteConflictError(Exception):
     """Raised when a concurrent write invalidates the state required for an update."""
+
+
+class RepositoryInvalidPromptFilterError(Exception):
+    """Raised when a linked-prompt filter is not an exact name/version comparison."""
+
+
+class RepositoryEmptySearchKeyError(Exception):
+    """Raised when a filter has an empty key."""
+
+
+class RepositoryInvalidFilterValueError(Exception):
+    """Raised when a filter value does not have its required type or range."""
+
+    def __init__(
+        self, expected: Literal["finite numbers", "a list of string values", "string values"]
+    ):
+        self.expected = expected
+        super().__init__(f"Search filter requires {expected}")

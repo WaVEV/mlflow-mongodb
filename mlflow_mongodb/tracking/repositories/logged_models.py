@@ -1,6 +1,5 @@
 """Persistence operations for logged models."""
 
-import re
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -13,7 +12,9 @@ from mlflow_mongodb.infrastructure.array_operations import (
     build_merge_array_expression,
     build_remove_array_element_update,
 )
+
 from mlflow_mongodb.infrastructure.repository_operations import repository_operation
+from mlflow_mongodb.infrastructure.search_conditions import COMPARISON_OPERATORS, like_regex
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 from mlflow_mongodb.infrastructure.errors import (
     RepositoryNotFoundError,
@@ -307,7 +308,6 @@ class LoggedModelRepository:
         candidates = []
         group: dict[str, Any] = {"_id": "$model_id"}
         required_matches = {}
-        operators = {"=": "$eq", "!=": "$ne", "<": "$lt", "<=": "$lte", ">": "$gt", ">=": "$gte"}
         for index, search_filter in enumerate(metric_filters):
             match = {
                 "k": search_filter.key,
@@ -316,7 +316,7 @@ class LoggedModelRepository:
             conditions = [
                 self._metric_scope_expression({"k": search_filter.key}),
                 {"$isNumber": "$v"},
-                {operators[search_filter.comparator]: ["$v", search_filter.value]},
+                {COMPARISON_OPERATORS[search_filter.comparator]: ["$v", search_filter.value]},
             ]
             if dataset_conditions:
                 match["$or"] = dataset_conditions
@@ -438,16 +438,13 @@ class LoggedModelRepository:
     @staticmethod
     def _value_condition(comparator: str, value: str | float | tuple[str, ...]) -> dict[str, Any]:
         if comparator in ("LIKE", "ILIKE"):
-            pattern = re.escape(value).replace("%", ".*").replace("_", ".")
-            return {
-                "$regex": f"\\A{pattern}\\z",
-                "$options": "is" if comparator == "ILIKE" else "s",
-            }
+            return {"$regex": like_regex(value, comparator)}
         if comparator == "!=":
             return {"$exists": True, "$nin": [None, value]}
         if comparator == "NOT IN":
             if not value:
                 return {"$exists": True}
             return {"$exists": True, "$nin": [None, *value]}
-        operators = {"=": "$eq", "<": "$lt", "<=": "$lte", ">": "$gt", ">=": "$gte", "IN": "$in"}
-        return {operators[comparator]: list(value) if comparator == "IN" else value}
+        if comparator == "IN":
+            return {"$in": list(value)}
+        return {COMPARISON_OPERATORS[comparator]: value}
