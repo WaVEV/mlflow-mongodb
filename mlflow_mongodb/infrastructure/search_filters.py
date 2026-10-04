@@ -4,6 +4,7 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from mlflow_mongodb.infrastructure.errors import (
@@ -11,6 +12,10 @@ from mlflow_mongodb.infrastructure.errors import (
     RepositoryInvalidRegexError,
     RepositoryUnsupportedComparatorError,
     RepositoryUnsupportedFieldTypeError,
+)
+
+COMPARISON_OPERATORS = MappingProxyType(
+    {"=": "$eq", "!=": "$ne", "<": "$lt", "<=": "$lte", ">": "$gt", ">=": "$gte"}
 )
 
 
