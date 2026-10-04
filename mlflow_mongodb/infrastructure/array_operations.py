@@ -19,15 +19,7 @@ def build_merge_array_expression(
     records: list[Mapping[str, Any]],
     identity: str,
 ) -> dict[str, Any]:
-    """Build a MongoDB expression that merges embedded records by identity.
-
-    Remove existing records matching incoming identities, then append the supplied records.
-    Unrelated records are preserved, and a missing or null array is treated as empty.
-    Callers supply records with unique identities.
-
-    Caller-provided records are wrapped as literals so their values are not interpreted as
-    aggregation expressions.
-    """
+    """Build a MongoDB expression that merges embedded records by identity."""
     incoming = {"$literal": [dict(record) for record in records]}
     keys = {"$literal": [record[identity] for record in records]}
     remaining_records = {
