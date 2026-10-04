@@ -1,6 +1,11 @@
 """Private MongoDB search primitives without entity-specific null semantics."""
 
 import re
+from types import MappingProxyType
+
+COMPARISON_OPERATORS = MappingProxyType(
+    {"=": "$eq", "!=": "$ne", "<": "$lt", "<=": "$lte", ">": "$gt", ">=": "$gte"}
+)
 
 
 def like_regex(value: str, comparator: str) -> re.Pattern[str]:
