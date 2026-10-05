@@ -10,6 +10,7 @@ from mlflow.protos.databricks_pb2 import (
 from mlflow.utils import validation as mlflow_validation
 
 from mlflow_mongodb import MongoDBModelRegistryStore
+from mlflow_mongodb.model_registry.errors import RegisteredModelNotFoundError
 
 MODEL_NAME = "mongodb-functional-alias-model"
 SUPPORTS_LATEST_ALIAS_LOOKUP = hasattr(
@@ -136,6 +137,46 @@ def test_deleting_alias_target_removes_alias(
     assert store.get_registered_model(MODEL_NAME).aliases == {}
     with pytest.raises(MlflowException, match="alias candidate not found"):
         store.get_model_version_by_alias(MODEL_NAME, "candidate")
+
+
+def test_set_alias_by_name_rejects_deleted_registered_model(
+    store: MongoDBModelRegistryStore,
+    model_versions,
+):
+    first_version, _ = model_versions
+    store.delete_registered_model(MODEL_NAME)
+
+    with pytest.raises(RegisteredModelNotFoundError) as caught:
+        store._registered_model_repository.set_alias_by_name(
+            name=MODEL_NAME,
+            alias="candidate",
+            version=first_version.version,
+        )
+
+    assert caught.value.args == (MODEL_NAME,)
+    assert store._registered_model_repository.find_by_name(MODEL_NAME) is None
+
+
+def test_delete_aliases_for_version_and_touch_rejects_deleted_registered_model(
+    store: MongoDBModelRegistryStore,
+    model_versions,
+):
+    first_version, _ = model_versions
+    store.set_registered_model_alias(MODEL_NAME, "candidate", first_version.version)
+    repository = store._registered_model_repository
+    model = repository.find_by_name(MODEL_NAME)
+    assert model is not None
+    store.delete_registered_model(MODEL_NAME)
+
+    with pytest.raises(RegisteredModelNotFoundError) as caught:
+        repository.delete_aliases_for_version_and_touch(
+            model_id=model.model_id,
+            version=first_version.version,
+            last_updated_timestamp=model.last_updated_timestamp + 1,
+        )
+
+    assert caught.value.args == (str(model.model_id),)
+    assert repository.find_by_name(MODEL_NAME) is None
 
 
 def test_alias_operations_validate_targets(store: MongoDBModelRegistryStore):

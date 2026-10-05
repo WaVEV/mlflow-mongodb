@@ -1,5 +1,6 @@
 """Broader MLflow model-registry search contracts backed by MongoDB."""
 
+import pytest
 from mlflow.entities.model_registry import (
     ModelVersion,
     ModelVersionTag,
@@ -7,10 +8,48 @@ from mlflow.entities.model_registry import (
 )
 
 from mlflow_mongodb import MongoDBModelRegistryStore
+from mlflow_mongodb.model_registry.repositories import (
+    ModelVersionFilter,
+    ModelVersionOrder,
+    RegisteredModelFilter,
+    RegisteredModelOrder,
+)
 
 
 def _search_model_version_numbers(store, filter_string):
     return {version.version for version in store.search_model_versions(filter_string)}
+
+
+def test_model_version_repository_rejects_unsupported_comparator(
+    store: MongoDBModelRegistryStore,
+):
+    name = "search-model-version-unsupported-comparator"
+    store.create_registered_model(name)
+    store.create_model_version(name, "models/unsupported-comparator", run_id="excluded-run")
+
+    with pytest.raises(ValueError, match="^Unsupported model-version comparator: NOT IN$"):
+        store._model_version_repository.search(
+            filters=(ModelVersionFilter("attribute", "run_id", "NOT IN", ("excluded-run",)),),
+            order_by=(ModelVersionOrder("version_number", True),),
+            exclude_prompts=True,
+            offset=0,
+            max_results=100,
+        )
+
+
+def test_registered_model_repository_rejects_unsupported_comparator(
+    store: MongoDBModelRegistryStore,
+):
+    name = "search-registered-model-unsupported-comparator"
+    store.create_registered_model(name)
+
+    with pytest.raises(ValueError, match="^Unsupported registered-model comparator: >$"):
+        store._registered_model_repository.search(
+            filters=(RegisteredModelFilter("attribute", "name", ">", name),),
+            order_by=(RegisteredModelOrder("name", True),),
+            offset=0,
+            max_results=100,
+        )
 
 
 def test_search_model_versions_supports_portable_attribute_filters(
@@ -48,6 +87,34 @@ def test_search_model_versions_supports_portable_attribute_filters(
     assert _search_model_version_numbers(store, "source_path = 'A/D'") == {3, 4}
     assert _search_model_version_numbers(store, "source_path = 'A'") == set()
     assert _search_model_version_numbers(store, "source_path = ''") == set()
+
+
+def test_search_model_versions_attribute_inequality_excludes_null_and_missing_values(
+    store: MongoDBModelRegistryStore,
+):
+    name = "search-model-version-attribute-inequality"
+    store.create_registered_model(name)
+    versions = {
+        state: store.create_model_version(name, f"models/{state}", run_id=run_id)
+        for state, run_id in (
+            ("equal", "excluded-run"),
+            ("different", "included-run"),
+            ("null", None),
+            ("missing", "removed-run"),
+        )
+    }
+
+    # The store writes an explicit null for omitted run IDs; unset one to test a missing field.
+    collection = store._database[store._settings.model_versions_collection_name]
+    result = collection.update_one({"run_id": "removed-run"}, {"$unset": {"run_id": ""}})
+    assert result.modified_count == 1
+
+    assert _search_model_version_numbers(store, f"name = '{name}'") == {
+        version.version for version in versions.values()
+    }
+    assert _search_model_version_numbers(
+        store, f"name = '{name}' AND run_id != 'excluded-run'"
+    ) == {versions["different"].version}
 
 
 def test_search_model_versions_reflects_model_version_changes(

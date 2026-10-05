@@ -192,6 +192,9 @@ def test_deleted_model_version_is_redacted_and_unavailable(
     operations = (
         lambda: store.get_model_version(name, version.version),
         lambda: store.update_model_version(name, version.version, "deleted"),
+        lambda: store.transition_model_version_stage(
+            name, version.version, "Staging", archive_existing_versions=False
+        ),
         lambda: store.delete_model_version(name, version.version),
         lambda: store.get_model_version_download_uri(name, version.version),
     )

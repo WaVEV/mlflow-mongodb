@@ -268,7 +268,6 @@ class MongoDBModelRegistryStore(AbstractStore):
 
     @cached_property
     def _registered_model_filter_validator(self) -> SearchFilterValidator:
-        # is_string_attribute/is_tag validate these same MLflow comparator sets.
         return ConfiguredSearchFilterValidator(
             field_types=("attribute", "tag"),
             attribute_keys=SearchModelUtils.VALID_SEARCH_ATTRIBUTE_KEYS,
