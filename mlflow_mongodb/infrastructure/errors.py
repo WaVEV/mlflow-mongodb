@@ -1,6 +1,7 @@
 """Shared infrastructure failures translated at the store boundary."""
 
 from collections.abc import Collection
+from typing import Literal
 
 
 class RepositoryAlreadyExistsError(Exception):
@@ -59,5 +60,22 @@ class RepositoryInvalidRegexError(Exception):
     """Raised when a filter contains an invalid regular expression."""
 
 
+class RepositoryEmptySearchKeyError(Exception):
+    """Raised when a filter has an empty key."""
+
+
+
+class RepositoryInvalidFilterValueError(Exception):
+    """Raised when a filter value does not have its required type or range."""
+
+    def __init__(
+        self, expected: Literal["finite numbers", "a list of string values", "string values"]
+    ):
+        self.expected = expected
+        super().__init__(f"Search filter requires {expected}")
+
+
+
 class RepositoryTagNotFoundError(Exception):
     """Raised when a requested tag is missing from an existing resource."""
+
