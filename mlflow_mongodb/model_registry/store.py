@@ -56,6 +56,15 @@ from pymongo.driver_info import DriverInfo
 from pymongo.errors import ConfigurationError
 
 from mlflow_mongodb._version import __version__
+from mlflow_mongodb.infrastructure.errors import (
+    RepositoryInvalidAttributeError,
+    RepositoryUnsupportedComparatorError,
+    RepositoryUnsupportedFieldTypeError,
+)
+from mlflow_mongodb.infrastructure.search_filters import (
+    ConfiguredSearchFilterValidator,
+    SearchFilterValidator,
+)
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 from mlflow_mongodb.model_registry.errors import (
     ModelVersionAlreadyExistsError,
@@ -257,8 +266,19 @@ class MongoDBModelRegistryStore(AbstractStore):
 
         return storage_location, run_id
 
-    @staticmethod
-    def _parse_registered_model_filters(filter_string):
+    @cached_property
+    def _registered_model_filter_validator(self) -> SearchFilterValidator:
+        # is_string_attribute/is_tag validate these same MLflow comparator sets.
+        return ConfiguredSearchFilterValidator(
+            field_types=("attribute", "tag"),
+            attribute_keys=SearchModelUtils.VALID_SEARCH_ATTRIBUTE_KEYS,
+            comparators={
+                "attribute": SearchModelUtils.VALID_STRING_ATTRIBUTE_COMPARATORS,
+                "tag": SearchModelUtils.VALID_TAG_COMPARATORS,
+            },
+        )
+
+    def _parse_registered_model_filters(self, filter_string):
         """Parse an MLflow filter string into normalized repository filters.
 
         For example, ``name = 'fraud-model'`` or ``tag.is_prompt = 'false'``.
@@ -268,26 +288,37 @@ class MongoDBModelRegistryStore(AbstractStore):
 
         filters = []
         for parsed_filter in parsed_filters:
-            field_type = parsed_filter["type"]
-            key = parsed_filter["key"]
-            comparator = parsed_filter["comparator"].upper()
-            value = parsed_filter["value"]
-            # These (is_string_attribute and is_tag) helpers validate the comparator by raising an
-            # MlflowException.
-            if field_type == "attribute":
-                SearchModelUtils.is_string_attribute(field_type, key, comparator)
-            elif field_type == "tag":
-                SearchModelUtils.is_tag(field_type, comparator)
-            else:
+            try:
+                clause = self._registered_model_filter_validator.validate(parsed_filter)
+            except RepositoryUnsupportedFieldTypeError as exc:
+                logger.error("Unable to validate registered model filter: %s", exc)
                 raise MlflowException.invalid_parameter_value(
-                    f"Invalid search expression type: {field_type}"
-                )
+                    f"Invalid search expression type: {exc.field_type}"
+                ) from None
+            except RepositoryInvalidAttributeError as exc:
+                logger.error("Unable to validate registered model filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid attribute name: {exc.key}"
+                ) from None
+            except RepositoryUnsupportedComparatorError as exc:
+                logger.error("Unable to validate registered model filter: %s", exc)
+                if exc.field_type == "attribute":
+                    message = (
+                        f"Invalid comparator '{exc.comparator}' not one of "
+                        f"'{SearchModelUtils.VALID_STRING_ATTRIBUTE_COMPARATORS}'"
+                    )
+                else:
+                    message = (
+                        f"Invalid comparator '{exc.comparator}' not one of "
+                        f"'{SearchModelUtils.VALID_TAG_COMPARATORS}"
+                    )
+                raise MlflowException.invalid_parameter_value(message) from None
             filters.append(
                 RegisteredModelFilter(
-                    field_type=field_type,
-                    key=key,
-                    comparator=comparator,
-                    value=value,
+                    field_type=clause.field_type,
+                    key=clause.key,
+                    comparator=clause.comparator,
+                    value=clause.value,
                 )
             )
         return tuple(filters)
@@ -327,65 +358,76 @@ class MongoDBModelRegistryStore(AbstractStore):
             parsed_order.append(RegisteredModelOrder(key="name", ascending=True))
         return tuple(parsed_order)
 
-    @staticmethod
-    def _parse_model_version_filters(filter_string):
+    @cached_property
+    def _model_version_filter_validator(self) -> SearchFilterValidator:
+        return ConfiguredSearchFilterValidator(
+            field_types=("attribute", "tag"),
+            attribute_keys=SearchModelVersionUtils.VALID_SEARCH_ATTRIBUTE_KEYS,
+            comparators={
+                "attribute": SearchModelVersionUtils.VALID_STRING_ATTRIBUTE_COMPARATORS - {"IN"},
+                "tag": SearchModelVersionUtils.VALID_TAG_COMPARATORS,
+            },
+            field_comparators={
+                ("attribute", "run_id"): SearchModelVersionUtils.VALID_STRING_ATTRIBUTE_COMPARATORS,
+                **{
+                    ("attribute", key): SearchModelVersionUtils.VALID_NUMERIC_ATTRIBUTE_COMPARATORS
+                    for key in SearchModelVersionUtils.NUMERIC_ATTRIBUTES
+                },
+            },
+        )
+
+    def _parse_model_version_filters(self, filter_string):
         """Parse model-version filter expressions into normalized repository filters."""
         parsed_filters = SearchModelVersionUtils.parse_search_filter(filter_string)
 
         filters = []
         querying_prompts = None
         for parsed_filter in parsed_filters:
-            field_type = parsed_filter["type"]
-            key = parsed_filter["key"]
-            comparator = parsed_filter["comparator"].upper()
-            value = parsed_filter["value"]
-
-            if field_type == "attribute":
-                if key not in SearchModelVersionUtils.VALID_SEARCH_ATTRIBUTE_KEYS:
-                    raise MlflowException(
-                        f"Invalid attribute name: {key}",
-                        error_code=INVALID_PARAMETER_VALUE,
-                    )
-                if key in SearchModelVersionUtils.NUMERIC_ATTRIBUTES:
-                    if (
-                        comparator
-                        not in SearchModelVersionUtils.VALID_NUMERIC_ATTRIBUTE_COMPARATORS
-                    ):
-                        raise MlflowException(
-                            f"Invalid comparator for attribute {key}: {comparator}",
-                            error_code=INVALID_PARAMETER_VALUE,
-                        )
-                    value = int(value)
-                elif (
-                    comparator not in SearchModelVersionUtils.VALID_STRING_ATTRIBUTE_COMPARATORS
-                    or (comparator == "IN" and key != "run_id")
+            try:
+                clause = self._model_version_filter_validator.validate(parsed_filter)
+            except RepositoryUnsupportedFieldTypeError as exc:
+                logger.error("Unable to validate model version filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid token type: {exc.field_type}"
+                ) from None
+            except RepositoryInvalidAttributeError as exc:
+                logger.error("Unable to validate model version filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid attribute name: {exc.key}"
+                ) from None
+            except RepositoryUnsupportedComparatorError as exc:
+                logger.error("Unable to validate model version filter: %s", exc)
+                if (
+                    exc.field_type == "attribute"
+                    and exc.key in SearchModelVersionUtils.NUMERIC_ATTRIBUTES
                 ):
-                    raise MlflowException(
-                        f"Invalid comparator for attribute: {comparator}",
-                        error_code=INVALID_PARAMETER_VALUE,
-                    )
-            elif field_type == "tag":
-                if comparator not in SearchModelVersionUtils.VALID_TAG_COMPARATORS:
-                    raise MlflowException.invalid_parameter_value(
-                        f"Invalid comparator for tag: {comparator}"
-                    )
-                if key == IS_PROMPT_TAG_KEY and querying_prompts is None:
-                    querying_prompts = (comparator == "=" and value.lower() == "true") or (
-                        comparator == "!=" and value.lower() == "false"
-                    )
-            else:
-                raise MlflowException(
-                    f"Invalid token type: {field_type}",
-                    error_code=INVALID_PARAMETER_VALUE,
+                    message = f"Invalid comparator for attribute {exc.key}: {exc.comparator}"
+                else:
+                    message = f"Invalid comparator for {exc.field_type}: {exc.comparator}"
+                raise MlflowException.invalid_parameter_value(message) from None
+
+            value = clause.value
+            if (
+                clause.field_type == "attribute"
+                and clause.key in SearchModelVersionUtils.NUMERIC_ATTRIBUTES
+            ):
+                value = int(value)
+            elif (
+                clause.field_type == "tag"
+                and clause.key == IS_PROMPT_TAG_KEY
+                and querying_prompts is None
+            ):
+                querying_prompts = (clause.comparator == "=" and value.lower() == "true") or (
+                    clause.comparator == "!=" and value.lower() == "false"
                 )
 
-            if comparator == "IN":
+            if clause.comparator == "IN":
                 value = tuple(value)
             filters.append(
                 ModelVersionFilter(
-                    field_type=field_type,
-                    key=key,
-                    comparator=comparator,
+                    field_type=clause.field_type,
+                    key=clause.key,
+                    comparator=clause.comparator,
                     value=value,
                 )
             )

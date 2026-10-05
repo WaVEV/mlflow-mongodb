@@ -1,7 +1,6 @@
 """Persistence operations for model versions."""
 
 import logging
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -16,10 +15,11 @@ from pymongo import ASCENDING, DESCENDING, ReturnDocument
 from pymongo.database import Database
 from pymongo.errors import DuplicateKeyError
 
-from mlflow_mongodb.infrastructure._array_updates import (
+from mlflow_mongodb.infrastructure.array_operations import (
     build_remove_array_element_update,
     build_replace_array_element_pipeline,
 )
+from mlflow_mongodb.infrastructure.search_filters import like_regex
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 from mlflow_mongodb.model_registry.errors import (
     ModelVersionAlreadyExistsError,
@@ -761,13 +761,7 @@ class ModelVersionRepository:
         if comparator not in ("LIKE", "ILIKE"):
             raise ValueError(f"Unsupported model-version comparator: {comparator}")
 
-        regex = re.escape(str(value)).replace("%", ".*").replace("_", ".")
-        if not str(value).startswith("%"):
-            regex = f"^{regex}"
-        if not str(value).endswith("%"):
-            regex = f"{regex}$"
-        flags = re.DOTALL | (re.IGNORECASE if comparator == "ILIKE" else 0)
-        return re.compile(regex, flags)
+        return like_regex(str(value), comparator)
 
     @staticmethod
     def _combine_clauses(clauses: Sequence[dict[str, Any]]) -> dict[str, Any]:
