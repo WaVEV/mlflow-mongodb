@@ -147,8 +147,11 @@ class ExperimentRepository:
         return experiment_id
 
     def find_by_id(self, experiment_id: str) -> ExperimentRecord | None:
-        document = self._collection.find_one({"_id": experiment_id})
-        return ExperimentRecord.from_document(document) if document is not None else None
+        try:
+            document = self._collection.find_one({"_id": experiment_id})
+            return ExperimentRecord.from_document(document) if document is not None else None
+        except (PyMongoError, BSONError) as exc:
+            raise RepositoryPersistenceError("Database operation 'find_by_id' failed.") from exc
 
     def find_by_name(self, name: str) -> ExperimentRecord | None:
         document = self._collection.find_one({"name": name})
