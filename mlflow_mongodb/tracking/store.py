@@ -1,4 +1,4 @@
-"""MongoDB tracking store with experiment persistence."""
+"""Skeleton of the MongoDB tracking store for the agreed V1 scope."""
 
 import logging
 from functools import cached_property
