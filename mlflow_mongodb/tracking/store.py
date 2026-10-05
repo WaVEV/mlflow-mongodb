@@ -1,7 +1,10 @@
 """Skeleton of the MongoDB tracking store for the agreed V1 scope."""
 
+import binascii
 import logging
+import math
 from functools import cached_property
+from typing import Any
 from uuid import uuid4
 
 from mlflow.entities import (
@@ -11,6 +14,7 @@ from mlflow.entities import (
     ExperimentTag,
     InputTag,
     LifecycleStage,
+    LoggedModel,
     LoggedModelInput,
     LoggedModelOutput,
     Metric,
@@ -24,8 +28,12 @@ from mlflow.entities import (
     RunTag,
     ViewType,
 )
+from mlflow.entities.logged_model_parameter import LoggedModelParameter
+from mlflow.entities.logged_model_status import LoggedModelStatus
+from mlflow.entities.logged_model_tag import LoggedModelTag
 from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import (
+    BAD_REQUEST,
     INTERNAL_ERROR,
     INVALID_PARAMETER_VALUE,
     INVALID_STATE,
@@ -34,6 +42,7 @@ from mlflow.protos.databricks_pb2 import (
 )
 from mlflow.store.entities.paged_list import PagedList
 from mlflow.store.tracking import (
+    SEARCH_LOGGED_MODEL_MAX_RESULTS_DEFAULT,
     SEARCH_MAX_RESULTS_DEFAULT,
     SEARCH_MAX_RESULTS_THRESHOLD,
 )
@@ -42,6 +51,8 @@ from mlflow.utils.mlflow_tags import MLFLOW_RUN_NAME, _get_run_name_from_tags
 from mlflow.utils.name_utils import _generate_random_name
 from mlflow.utils.search_utils import (
     SearchExperimentsUtils,
+    SearchLoggedModelsPaginationToken,
+    SearchLoggedModelsUtils,
     SearchUtils,
 )
 from mlflow.utils.time import get_current_time_millis
@@ -54,6 +65,7 @@ from mlflow.utils.validation import (
     _validate_experiment_artifact_location_length,
     _validate_experiment_name,
     _validate_experiment_tag,
+    _validate_logged_model_name,
     _validate_metric_name,
     _validate_param_keys_unique,
     _validate_run_id,
@@ -63,12 +75,15 @@ from pymongo.database import Database
 from pymongo.errors import ConfigurationError
 
 from mlflow_mongodb.infrastructure.errors import (
+    RepositoryEmptySearchKeyError,
     RepositoryInvalidAttributeError,
+    RepositoryInvalidFilterValueError,
     RepositoryUnsupportedComparatorError,
     RepositoryUnsupportedFieldTypeError,
 )
 from mlflow_mongodb.infrastructure.search_filters import (
     ConfiguredSearchFilterValidator,
+    SearchFilterClause,
     SearchFilterValidator,
 )
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
@@ -78,14 +93,62 @@ from mlflow_mongodb.tracking.errors import (
     RepositoryNotFoundError,
     RepositoryParamConflictError,
     RepositoryPersistenceError,
+    RepositoryTagNotFoundError,
 )
 from mlflow_mongodb.tracking.repositories import (
     ExperimentRepository,
+    LoggedModelRepository,
     RunRepository,
 )
 from mlflow_mongodb.tracking.repositories.experiments import ExperimentFilter, ExperimentOrder
 
+from mlflow_mongodb.tracking.repositories.logged_models import LoggedModelFilter, LoggedModelOrder
+from mlflow_mongodb.tracking.types import LoggedModelRecord, RunMetricRecord
+
 logger = logging.getLogger(__name__)
+
+
+def _normalize_logged_model_search_key(key: str) -> str:
+    # The SQL-backed MLflow parser emits these names for timestamp aliases.
+    if key in ("creation_timestamp_ms", "last_updated_timestamp_ms"):
+        return key.removesuffix("_ms")
+    return key
+
+
+
+def _stored_logged_model_attribute_key(key: str) -> str:
+    if key == "creation_time":
+        return "creation_timestamp"
+    if key == "last_updated_time":
+        return "last_updated_timestamp"
+    return key
+
+
+
+def _is_numeric_logged_model_filter(clause: SearchFilterClause) -> bool:
+    # Preserve classification after the existing attribute-to-storage key translation.
+    return clause.field_type == "metric" or (
+        clause.field_type == "attribute"
+        and _stored_logged_model_attribute_key(clause.key)
+        in SearchLoggedModelsUtils.NUMERIC_ATTRIBUTES
+    )
+
+
+
+def _validate_logged_model_filter_value(clause: SearchFilterClause) -> None:
+    if not clause.key:
+        raise RepositoryEmptySearchKeyError("Search key must not be empty.")
+    if _is_numeric_logged_model_filter(clause):
+        if not isinstance(clause.value, (int, float)) or not math.isfinite(clause.value):
+            raise RepositoryInvalidFilterValueError("finite numbers")
+    elif clause.comparator in ("IN", "NOT IN"):
+        if not isinstance(clause.value, (list, tuple)) or not all(
+            isinstance(value, str) for value in clause.value
+        ):
+            raise RepositoryInvalidFilterValueError("a list of string values")
+    elif not isinstance(clause.value, str):
+        raise RepositoryInvalidFilterValueError("string values")
+
 
 
 class MongoDBTrackingStore(AbstractStore):
@@ -778,3 +841,464 @@ class MongoDBTrackingStore(AbstractStore):
             ],
             next_token,
         )
+
+    @cached_property
+    def _logged_model_repository(self) -> LoggedModelRepository:
+        return LoggedModelRepository(self._database, settings=self._settings)
+
+
+    def create_logged_model(
+        self,
+        experiment_id: str,
+        name: str | None = None,
+        source_run_id: str | None = None,
+        tags: list[LoggedModelTag] | None = None,
+        params: list[LoggedModelParameter] | None = None,
+        model_type: str | None = None,
+    ) -> LoggedModel:
+        """Create a pending logged model and persist its metadata atomically."""
+        _validate_logged_model_name(name)
+
+        # Preserve SQLAlchemyStore's rejection of duplicate and null entries
+        # before embedding them in arrays in a single MongoDB document.
+        for field, entries in (("params", params), ("tags", tags)):
+            seen_keys = set()
+            for entry in entries or []:
+                if entry.key is None or entry.value is None or entry.key in seen_keys:
+                    raise MlflowException(
+                        f"Logged model {field} must have unique, non-null keys "
+                        "and non-null values.",
+                        BAD_REQUEST,
+                    )
+                seen_keys.add(entry.key)
+
+        try:
+            experiment = self.get_experiment(experiment_id)
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to load experiment for logged model: %s", exc)
+            raise MlflowException("Unable to create logged model.", INTERNAL_ERROR) from None
+
+        if experiment.lifecycle_stage != LifecycleStage.ACTIVE:
+            raise MlflowException(
+                (
+                    f"The experiment {experiment.experiment_id} must be in the 'active' state. "
+                    f"Current state is {experiment.lifecycle_stage}."
+                ),
+                INVALID_PARAMETER_VALUE,
+            )
+
+        model_id = f"m-{uuid4().hex}"
+        artifact_location = append_to_uri_path(
+            experiment.artifact_location, "models", model_id, "artifacts"
+        )
+        try:
+            record = self._logged_model_repository.create(
+                model_id=model_id,
+                experiment_id=experiment.experiment_id,
+                name=name or _generate_random_name(),
+                artifact_location=artifact_location,
+                creation_timestamp=get_current_time_millis(),
+                status=LoggedModelStatus.PENDING.value,
+                lifecycle_stage=LifecycleStage.ACTIVE,
+                source_run_id=source_run_id,
+                model_type=model_type,
+                tags={tag.key: tag.value for tag in tags or []},
+                params={param.key: param.value for param in params or []},
+            )
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to create logged model: %s", exc)
+            raise MlflowException("Unable to create logged model.", INTERNAL_ERROR) from None
+
+        return self._to_logged_model(record)
+
+
+    @staticmethod
+    def _to_logged_model(
+        record: LoggedModelRecord, metrics: tuple[RunMetricRecord, ...] = ()
+    ) -> LoggedModel:
+        return LoggedModel(
+            model_id=record.model_id,
+            experiment_id=record.experiment_id,
+            name=record.name,
+            artifact_location=record.artifact_location,
+            creation_timestamp=record.creation_timestamp,
+            last_updated_timestamp=record.last_updated_timestamp,
+            status=LoggedModelStatus(record.status),
+            status_message=record.status_message,
+            source_run_id=record.source_run_id,
+            model_type=record.model_type,
+            tags=[LoggedModelTag(tag.key, tag.value) for tag in record.tags],
+            params=[LoggedModelParameter(param.key, param.value) for param in record.params],
+            metrics=[
+                Metric(
+                    key=metric.key,
+                    value=metric.value,
+                    timestamp=metric.timestamp,
+                    step=metric.step,
+                    model_id=record.model_id,
+                    run_id=metric.run_id,
+                    dataset_name=metric.dataset_name,
+                    dataset_digest=metric.dataset_digest,
+                )
+                for metric in metrics
+            ]
+            or None,
+        )
+
+
+    @staticmethod
+    def _logged_model_attribute_key(key: str, *, order_by: bool = False) -> str:
+        # MLflow's filter parser emits SQL timestamp names; MongoDB stores entity names.
+        key = _normalize_logged_model_search_key(key)
+        valid_keys = (
+            SearchLoggedModelsUtils.VALID_ORDER_BY_ATTRIBUTE_KEYS
+            if order_by
+            else SearchLoggedModelsUtils.VALID_SEARCH_ATTRIBUTE_KEYS
+        )
+        if key not in valid_keys:
+            raise MlflowException.invalid_parameter_value(
+                f"Invalid logged model attribute: {key!r}."
+            )
+        return _stored_logged_model_attribute_key(key)
+
+
+    @staticmethod
+    def _validate_logged_model_datasets(datasets: list[dict[str, Any]] | None) -> None:
+        if datasets is None:
+            return
+        if not isinstance(datasets, list):
+            raise MlflowException.invalid_parameter_value(
+                "`datasets` must be a list of dictionaries."
+            )
+        for dataset in datasets:
+            if not isinstance(dataset, dict) or not dataset.get("dataset_name"):
+                raise MlflowException.invalid_parameter_value(
+                    "`dataset_name` in the `datasets` clause must be specified."
+                )
+            if not isinstance(dataset["dataset_name"], str) or (
+                dataset.get("dataset_digest") is not None
+                and not isinstance(dataset["dataset_digest"], str)
+            ):
+                raise MlflowException.invalid_parameter_value(
+                    "Dataset names and digests must be strings."
+                )
+
+
+    @cached_property
+    def _logged_model_filter_validator(self) -> SearchFilterValidator:
+        # parse_filter_string already validates operators with Entity.validate_op; its rules
+        # differ from SearchLoggedModelsUtils for tag/param membership and timestamp aliases.
+        return ConfiguredSearchFilterValidator(
+            field_types=("attribute", "metric", "param", "tag"),
+            attribute_keys=SearchLoggedModelsUtils.VALID_SEARCH_ATTRIBUTE_KEYS,
+            rules=(_validate_logged_model_filter_value,),
+            uppercase_comparators=False,
+        )
+
+
+    def _parse_logged_model_filters(
+        self, filter_string: str | None
+    ) -> tuple[LoggedModelFilter, ...]:
+        # The parser imports SQL models; defer it until MLflow finishes store discovery.
+        from mlflow.utils.search_logged_model_utils import (  # ruff: ignore[import-outside-top-level]
+            parse_filter_string,
+        )
+
+        if filter_string is not None and not isinstance(filter_string, str):
+            raise MlflowException.invalid_parameter_value("`filter_string` must be a string.")
+        try:
+            comparisons = parse_filter_string(filter_string)
+        except (ValueError, TypeError, SyntaxError) as exc:
+            logger.error("Unable to parse logged model filter: %s", exc)
+            raise MlflowException.invalid_parameter_value(
+                "Invalid logged model filter string."
+            ) from None
+
+        filters = []
+        for comparison in comparisons:
+            field_type = comparison.entity.type.name.lower()
+            key = comparison.entity.key
+            if field_type == "attribute":
+                key = _normalize_logged_model_search_key(key)
+            parsed = {
+                "type": field_type,
+                "key": key,
+                "comparator": comparison.op,
+                "value": comparison.value,
+            }
+            try:
+                clause = self._logged_model_filter_validator.validate(parsed)
+            except RepositoryUnsupportedFieldTypeError as exc:
+                logger.error("Unable to validate logged model filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid logged model search field type: {exc.field_type}"
+                ) from None
+            except RepositoryInvalidAttributeError as exc:
+                logger.error("Unable to validate logged model filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid logged model attribute: {exc.key!r}."
+                ) from None
+            except RepositoryEmptySearchKeyError as exc:
+                logger.error("Unable to validate logged model filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    "Search keys must not be empty."
+                ) from None
+            except RepositoryInvalidFilterValueError as exc:
+                logger.error("Unable to validate logged model filter value: %s", exc)
+                messages = {
+                    "finite numbers": "Numeric filters require finite numbers.",
+                    "a list of string values": "IN and NOT IN require a list of string values.",
+                    "string values": "String filters require string values.",
+                }
+                raise MlflowException.invalid_parameter_value(messages[exc.expected]) from None
+
+            key = (
+                _stored_logged_model_attribute_key(clause.key)
+                if clause.field_type == "attribute"
+                else clause.key
+            )
+            value = clause.value
+            if clause.comparator in ("IN", "NOT IN") and not _is_numeric_logged_model_filter(
+                clause
+            ):
+                value = tuple(value)
+            filters.append(LoggedModelFilter(clause.field_type, key, clause.comparator, value))
+        return tuple(filters)
+
+
+    @classmethod
+    def _parse_logged_model_order(
+        cls, order_by: list[dict[str, Any]] | None
+    ) -> tuple[LoggedModelOrder, ...]:
+        if order_by is not None and not isinstance(order_by, list):
+            raise MlflowException.invalid_parameter_value(
+                "`order_by` must be a list of dictionaries."
+            )
+        orders = []
+        seen = set()
+        for order in order_by or []:
+            if not isinstance(order, dict) or not isinstance(order.get("field_name"), str):
+                raise MlflowException.invalid_parameter_value(
+                    "`field_name` in the `order_by` clause must be specified as a string."
+                )
+            field = order["field_name"]
+            if "." in field:
+                entity, key = field.split(".", 1)
+                if entity != "metrics" or not key:
+                    raise MlflowException.invalid_parameter_value(
+                        f"Invalid order by field name: {field!r}. Only metrics support a prefix."
+                    )
+                field_type = "metric"
+            else:
+                key = cls._logged_model_attribute_key(field, order_by=True)
+                field_type = "attribute"
+            ascending = order.get("ascending", True)
+            if not isinstance(ascending, bool):
+                raise MlflowException.invalid_parameter_value("`ascending` must be a boolean.")
+            dataset_name = order.get("dataset_name")
+            dataset_digest = order.get("dataset_digest")
+            if any(
+                value is not None and not isinstance(value, str)
+                for value in (dataset_name, dataset_digest)
+            ):
+                raise MlflowException.invalid_parameter_value(
+                    "Dataset names and digests must be strings."
+                )
+            if dataset_digest and not dataset_name:
+                raise MlflowException.invalid_parameter_value(
+                    "`dataset_digest` can only be specified if `dataset_name` is also specified."
+                )
+            if field_type != "metric" and (dataset_name or dataset_digest):
+                raise MlflowException.invalid_parameter_value(
+                    "Dataset ordering applies only to metrics."
+                )
+            identity = (field_type, key, dataset_name or None, dataset_digest or None)
+            # Later repetitions of the same sort expression cannot change its ordering.
+            if identity not in seen:
+                seen.add(identity)
+                orders.append(
+                    LoggedModelOrder(field_type, key, ascending, dataset_name, dataset_digest)
+                )
+        for key, ascending in (("creation_timestamp", False), ("model_id", True)):
+            if not any(order.field_type == "attribute" and order.key == key for order in orders):
+                orders.append(LoggedModelOrder("attribute", key, ascending))
+        sort_keys = sum(
+            2
+            if order.field_type == "metric"
+            or order.key
+            in {
+                "model_type",
+                "source_run_id",
+                "status_message",
+            }
+            else 1
+            for order in orders
+        )
+        if sort_keys > 32:
+            raise MlflowException.invalid_parameter_value("Too many order_by fields.")
+        return tuple(orders)
+
+
+    @staticmethod
+    def _parse_logged_model_page_token(
+        page_token: str | None,
+        experiment_ids: list[str],
+        filter_string: str | None,
+        order_by: list[dict[str, Any]] | None,
+    ) -> int:
+        if page_token is not None and not isinstance(page_token, str):
+            raise MlflowException.invalid_parameter_value("Invalid logged model page token.")
+        if not page_token:
+            return 0
+        try:
+            token = SearchLoggedModelsPaginationToken.decode(page_token)
+        except (MlflowException, ValueError, TypeError, AttributeError, binascii.Error) as exc:
+            logger.error("Unable to parse logged model page token: %s", exc)
+            raise MlflowException.invalid_parameter_value(
+                "Invalid logged model page token."
+            ) from None
+        if (
+            isinstance(token.offset, bool)
+            or not isinstance(token.offset, int)
+            or not 0 <= token.offset < 2**63
+        ):
+            raise MlflowException.invalid_parameter_value("Invalid logged model page token offset.")
+        token.validate(experiment_ids, filter_string or None, order_by or None)
+        return token.offset
+
+
+    def search_logged_models(
+        self,
+        experiment_ids: list[str],
+        filter_string: str | None = None,
+        datasets: list[dict[str, Any]] | None = None,
+        max_results: int | None = None,
+        order_by: list[dict[str, Any]] | None = None,
+        page_token: str | None = None,
+    ) -> PagedList[LoggedModel]:
+        """Search model metadata and associated metrics within the requested experiments."""
+        self._validate_logged_model_datasets(datasets)
+        if not isinstance(experiment_ids, list) or not all(
+            isinstance(experiment_id, str) for experiment_id in experiment_ids
+        ):
+            raise MlflowException.invalid_parameter_value(
+                "`experiment_ids` must be a list of strings."
+            )
+        offset = self._parse_logged_model_page_token(
+            page_token, experiment_ids, filter_string, order_by
+        )
+        if isinstance(max_results, bool) or (
+            max_results is not None and not isinstance(max_results, int)
+        ):
+            raise MlflowException.invalid_parameter_value("`max_results` must be an integer.")
+        max_results = max_results or SEARCH_LOGGED_MODEL_MAX_RESULTS_DEFAULT
+        if max_results < 1:
+            raise MlflowException.invalid_parameter_value(
+                "`max_results` must be a positive integer."
+            )
+        filters = self._parse_logged_model_filters(filter_string)
+        orders = self._parse_logged_model_order(order_by)
+        if not experiment_ids:
+            return PagedList([], None)
+        try:
+            page = self._logged_model_repository.search(
+                experiment_ids=experiment_ids,
+                filters=filters,
+                datasets=datasets or [],
+                order_by=orders,
+                offset=offset,
+                max_results=max_results,
+            )
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to search logged models: %s", exc)
+            raise MlflowException("Unable to search logged models.", INTERNAL_ERROR) from None
+
+        next_token = (
+            SearchLoggedModelsPaginationToken(
+                experiment_ids=experiment_ids,
+                filter_string=filter_string or None,
+                order_by=order_by or None,
+                offset=offset + max_results,
+            ).encode()
+            if page.has_more
+            else None
+        )
+        return PagedList(
+            [self._to_logged_model(result.model, result.metrics) for result in page.records],
+            next_token,
+        )
+
+
+    def get_logged_model(self, model_id: str, allow_deleted: bool = False) -> LoggedModel:
+        """Fetch model metadata and its complete associated metric history."""
+        try:
+            record = self._logged_model_repository.find_by_id(model_id)
+            if record is None or (
+                not allow_deleted and record.lifecycle_stage == LifecycleStage.DELETED
+            ):
+                raise MlflowException(
+                    f"Logged model with ID '{model_id}' not found.", RESOURCE_DOES_NOT_EXIST
+                )
+            metrics = self._logged_model_repository.get_metric_history(record.model_id)
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to get logged model: %s", exc)
+            raise MlflowException("Unable to get logged model.", INTERNAL_ERROR) from None
+
+        return self._to_logged_model(record, metrics)
+
+
+    def delete_logged_model(self, model_id: str) -> None:
+        """Soft-delete a logged model and refresh its last-updated timestamp."""
+        try:
+            self._logged_model_repository.mark_deleted(
+                model_id=model_id,
+                last_updated_timestamp=get_current_time_millis(),
+            )
+        except RepositoryNotFoundError as exc:
+            logger.error("Unable to delete logged model: %s", exc)
+            raise MlflowException(
+                f"Logged model with ID '{model_id}' not found.", RESOURCE_DOES_NOT_EXIST
+            ) from None
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to delete logged model: %s", exc)
+            raise MlflowException("Unable to delete logged model.", INTERNAL_ERROR) from None
+
+
+    def set_logged_model_tags(self, model_id: str, tags: list[LoggedModelTag]) -> None:
+        """Set model tags, keeping the last value for each key in the batch."""
+        tags_by_key = {tag.key: tag.value for tag in tags}
+        if any(k is None or v is None for k, v in tags_by_key.items()):
+            raise MlflowException(
+                "Logged model tags must have non-null keys and values.", BAD_REQUEST
+            )
+        try:
+            self._logged_model_repository.set_tags(model_id=model_id, tags=tags_by_key)
+        except RepositoryNotFoundError as exc:
+            logger.error("Unable to set logged model tags: %s", exc)
+            raise MlflowException(
+                f"Logged model with ID '{model_id}' not found.", RESOURCE_DOES_NOT_EXIST
+            ) from None
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to set logged model tags: %s", exc)
+            raise MlflowException("Unable to set logged model tags.", INTERNAL_ERROR) from None
+
+
+    def delete_logged_model_tag(self, model_id: str, key: str) -> None:
+        """Delete a model tag, failing if the model or tag does not exist."""
+        try:
+            self._logged_model_repository.delete_tag(model_id=model_id, key=key)
+        except RepositoryNotFoundError as exc:
+            logger.error("Unable to delete logged model tag: %s", exc)
+            raise MlflowException(
+                f"Logged model with ID '{model_id}' not found.", RESOURCE_DOES_NOT_EXIST
+            ) from None
+        except RepositoryTagNotFoundError as exc:
+            logger.error("Unable to delete logged model tag: %s", exc)
+            raise MlflowException(
+                f"No tag with key {key!r} found for model with ID {model_id!r}.",
+                RESOURCE_DOES_NOT_EXIST,
+            ) from None
+        except RepositoryPersistenceError as exc:
+            logger.error("Unable to delete logged model tag: %s", exc)
+            raise MlflowException("Unable to delete logged model tag.", INTERNAL_ERROR) from None
+
