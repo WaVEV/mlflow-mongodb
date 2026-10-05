@@ -15,3 +15,7 @@ class RepositoryNotFoundError(Exception):
 
 class RepositoryNotActiveError(Exception):
     """Raised when an operation requires an active resource."""
+
+
+class RepositoryParamConflictError(Exception):
+    """Raised when an operation attempts to change an existing parameter value."""

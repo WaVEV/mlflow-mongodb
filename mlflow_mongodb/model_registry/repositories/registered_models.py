@@ -376,7 +376,6 @@ class RegisteredModelRepository:
             build_replace_array_element_pipeline(
                 array_field="tags",
                 key_field="key",
-                key=key,
                 element={"key": key, "value": value},
             ),
             return_document=ReturnDocument.AFTER,
@@ -440,7 +439,6 @@ class RegisteredModelRepository:
             build_replace_array_element_pipeline(
                 array_field="aliases",
                 key_field="alias",
-                key=alias,
                 element={"alias": alias, "version": version},
             ),
             return_document=ReturnDocument.AFTER,

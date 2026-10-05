@@ -398,7 +398,6 @@ class ModelVersionRepository:
             build_replace_array_element_pipeline(
                 array_field="tags",
                 key_field="key",
-                key=key,
                 element={"key": key, "value": value},
             ),
             return_document=ReturnDocument.AFTER,
