@@ -39,6 +39,155 @@ class ExperimentRecord:
 
 
 @dataclass(frozen=True)
+class LoggedModelTagRecord:
+    """Stored logged-model tag data."""
+
+    key: str
+    value: str
+
+
+@dataclass(frozen=True)
+class LoggedModelParameterRecord:
+    """Stored logged-model parameter data."""
+
+    key: str
+    value: str
+
+
+@dataclass(frozen=True)
+class LoggedModelRecord:
+    """Typed representation of a logged-model document."""
+
+    model_id: str
+    experiment_id: str
+    name: str
+    artifact_location: str
+    creation_timestamp: int
+    last_updated_timestamp: int
+    status: str
+    status_message: str | None
+    lifecycle_stage: str
+    source_run_id: str | None
+    model_type: str | None
+    tags: tuple[LoggedModelTagRecord, ...]
+    params: tuple[LoggedModelParameterRecord, ...]
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any]) -> "LoggedModelRecord":
+        return cls(
+            model_id=document["_id"],
+            experiment_id=document["experiment_id"],
+            name=document["name"],
+            artifact_location=document["artifact_location"],
+            creation_timestamp=document["creation_timestamp"],
+            last_updated_timestamp=document["last_updated_timestamp"],
+            status=document["status"],
+            status_message=document["status_message"],
+            lifecycle_stage=document["lifecycle_stage"],
+            source_run_id=document["source_run_id"],
+            model_type=document["model_type"],
+            tags=tuple(LoggedModelTagRecord(tag["k"], tag["v"]) for tag in document["tags"]),
+            params=tuple(
+                LoggedModelParameterRecord(param["k"], param["v"]) for param in document["params"]
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class TraceRecord:
+    """Trace metadata stored independently from span payloads."""
+
+    trace_id: str
+    experiment_id: str
+    request_time: int
+    state: str
+    execution_duration: int | None
+    client_request_id: str | None
+    request_preview: str | None
+    response_preview: str | None
+    tags: tuple[ExperimentTagRecord, ...]
+    trace_metadata: tuple[ExperimentTagRecord, ...]
+    assessments: tuple[dict[str, Any], ...]
+    span_stats: dict[str, Any] | None = None
+    run_ids: tuple[str, ...] = ()
+
+    @classmethod
+    def from_document(
+        cls,
+        document: Mapping[str, Any],
+        *,
+        assessments: tuple[dict[str, Any], ...] = (),
+    ) -> "TraceRecord":
+        return cls(
+            trace_id=document["_id"],
+            experiment_id=document["experiment_id"],
+            request_time=document["request_time"],
+            state=document["state"],
+            execution_duration=document.get("execution_duration"),
+            client_request_id=document.get("client_request_id"),
+            request_preview=document.get("request_preview"),
+            response_preview=document.get("response_preview"),
+            tags=tuple(ExperimentTagRecord(t["k"], t["v"]) for t in document.get("tags", [])),
+            trace_metadata=tuple(
+                ExperimentTagRecord(m["k"], m["v"]) for m in document.get("trace_metadata", [])
+            ),
+            assessments=assessments,
+            span_stats=document.get("span_stats"),
+            run_ids=tuple(document.get("run_ids", [])),
+        )
+
+
+@dataclass(frozen=True)
+class SpanRecord:
+    """Persisted span payload returned when loading a trace."""
+
+    trace_id: str
+    span_id: str
+    parent_span_id: str | None
+    start_time_ns: int
+    end_time_ns: int | None
+    content: dict[str, Any]
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any]) -> "SpanRecord":
+        return cls(
+            trace_id=document["trace_id"],
+            span_id=document["span_id"],
+            parent_span_id=document.get("parent_span_id"),
+            start_time_ns=document["start_time_ns"],
+            end_time_ns=document.get("end_time_ns"),
+            content=document["content"],
+        )
+
+
+@dataclass(frozen=True)
+class SpanSummaryRecord:
+    """Span fields needed to recompute a trace summary."""
+
+    span_id: str
+    parent_span_id: str | None
+    status: str
+    start_time_ns: int
+    end_time_ns: int | None
+    token_usage: dict[str, Any] | None
+    cost: dict[str, Any] | None
+    trace_fields: dict[str, Any]
+
+    @classmethod
+    def from_document(cls, document: Mapping[str, Any]) -> "SpanSummaryRecord":
+        return cls(
+            span_id=document["span_id"],
+            parent_span_id=document.get("parent_span_id"),
+            status=document["status"],
+            start_time_ns=document["start_time_ns"],
+            end_time_ns=document.get("end_time_ns"),
+            token_usage=document.get("token_usage"),
+            cost=document.get("cost"),
+            trace_fields=document.get("trace_fields", {}),
+        )
+
+
+@dataclass(frozen=True)
 class RunMetricRecord:
     """Stored metric from run history or the latest-per-key summary."""
 

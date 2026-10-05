@@ -5,6 +5,14 @@ class RepositoryPersistenceError(Exception):
     """Raised when a repository database operation fails."""
 
 
+class RepositoryInvalidDocumentError(Exception):
+    """Raised when a document cannot be encoded as BSON."""
+
+
+class RepositoryDocumentTooLargeError(Exception):
+    """Raised when a document exceeds MongoDB's BSON size limit."""
+
+
 class RepositoryAlreadyExistsError(Exception):
     """Raised when a resource with the requested unique identity already exists."""
 
@@ -19,3 +27,11 @@ class RepositoryNotActiveError(Exception):
 
 class RepositoryParamConflictError(Exception):
     """Raised when an operation attempts to change an existing parameter value."""
+
+
+class RepositoryTagNotFoundError(Exception):
+    """Raised when a requested tag is missing from an existing resource."""
+
+
+class RepositoryWriteConflictError(Exception):
+    """Raised when a concurrent write invalidates the state required for an update."""
