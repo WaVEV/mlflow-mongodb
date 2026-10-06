@@ -29,10 +29,11 @@ from mlflow_mongodb.model_registry.repositories import (
     ],
 )
 def test_parse_registered_model_filters_adds_prompt_exclusion(
+    store,
     filter_string,
     expected_filter,
 ):
-    filters = MongoDBModelRegistryStore._parse_registered_model_filters(filter_string)
+    filters = store._parse_registered_model_filters(filter_string)
 
     assert filters == (
         expected_filter,
@@ -66,8 +67,8 @@ def test_parse_registered_model_filters_adds_prompt_exclusion(
         ),
     ],
 )
-def test_parse_model_version_filters(filter_string, expected_filter):
-    filters, exclude_prompts = MongoDBModelRegistryStore._parse_model_version_filters(filter_string)
+def test_parse_model_version_filters(store, filter_string, expected_filter):
+    filters, exclude_prompts = store._parse_model_version_filters(filter_string)
 
     assert filters == (expected_filter,)
     assert exclude_prompts is True
@@ -78,15 +79,14 @@ def test_parse_model_version_filters(filter_string, expected_filter):
     [("=", "true", False), ("!=", "false", False), ("=", "false", True), ("!=", "true", True)],
 )
 def test_parse_model_version_prompt_filter_controls_exclusion(
+    store,
     comparator,
     value,
     exclude_prompts,
 ):
     filter_string = f"tags.`{IS_PROMPT_TAG_KEY}` {comparator} '{value}'"
 
-    filters, actual_exclude_prompts = MongoDBModelRegistryStore._parse_model_version_filters(
-        filter_string
-    )
+    filters, actual_exclude_prompts = store._parse_model_version_filters(filter_string)
 
     assert filters == (ModelVersionFilter("tag", IS_PROMPT_TAG_KEY, comparator, value),)
     assert actual_exclude_prompts is exclude_prompts
@@ -96,54 +96,55 @@ def test_parse_model_version_prompt_filter_controls_exclusion(
     ("parser", "invalid_value", "expected_message"),
     [
         (
-            MongoDBModelRegistryStore._parse_registered_model_filters,
+            "_parse_registered_model_filters",
             "name > 'fraud'",
             "Invalid comparator",
         ),
         (
-            MongoDBModelRegistryStore._parse_registered_model_filters,
+            "_parse_registered_model_filters",
             "tags.team IN ('risk', 'platform')",
             "Expected a quoted string value",
         ),
         (
-            MongoDBModelRegistryStore._parse_model_version_filters,
+            "_parse_model_version_filters",
             "name IN ('fraud', 'credit')",
             "Only the 'run_id' attribute",
         ),
         (
-            MongoDBModelRegistryStore._parse_model_version_filters,
+            "_parse_model_version_filters",
             "version_number LIKE '2'",
             "Invalid comparator",
         ),
         (
-            MongoDBModelRegistryStore._parse_model_version_filters,
+            "_parse_model_version_filters",
             "unknown_attribute = 'fraud'",
             "Invalid attribute key",
         ),
         (
-            MongoDBModelRegistryStore._parse_model_version_filters,
+            "_parse_model_version_filters",
             "name > 'fraud'",
             "Invalid comparator for attribute",
         ),
         (
-            MongoDBModelRegistryStore._parse_model_version_filters,
+            "_parse_model_version_filters",
             "tags.team > 'risk'",
             "Invalid comparator for tag",
         ),
     ],
 )
 def test_filter_parsers_reject_invalid_comparator_contracts(
+    store,
     parser,
     invalid_value,
     expected_message,
 ):
     with pytest.raises(MlflowException, match=expected_message) as exc_info:
-        parser(invalid_value)
+        getattr(store, parser)(invalid_value)
 
     assert exc_info.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
 
 
-def test_registered_model_filter_parser_rejects_unexpected_expression_type(monkeypatch):
+def test_registered_model_filter_parser_rejects_unexpected_expression_type(store, monkeypatch):
     monkeypatch.setattr(
         SearchModelUtils,
         "parse_search_filter",
@@ -156,7 +157,7 @@ def test_registered_model_filter_parser_rejects_unexpected_expression_type(monke
         MlflowException,
         match="Invalid search expression type: unexpected",
     ) as exc_info:
-        MongoDBModelRegistryStore._parse_registered_model_filters("name = 'model'")
+        store._parse_registered_model_filters("name = 'model'")
 
     assert exc_info.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
 
@@ -177,7 +178,7 @@ def test_registered_model_order_parser_rejects_unexpected_order_entity(monkeypat
     assert exc_info.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
 
 
-def test_model_version_filter_parser_rejects_unexpected_token_type(monkeypatch):
+def test_model_version_filter_parser_rejects_unexpected_token_type(store, monkeypatch):
     monkeypatch.setattr(
         SearchModelVersionUtils,
         "parse_search_filter",
@@ -190,12 +191,12 @@ def test_model_version_filter_parser_rejects_unexpected_token_type(monkeypatch):
         MlflowException,
         match="Invalid token type: unexpected",
     ) as exc_info:
-        MongoDBModelRegistryStore._parse_model_version_filters("name = 'model'")
+        store._parse_model_version_filters("name = 'model'")
 
     assert exc_info.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
 
 
-def test_model_version_filter_parser_rejects_unsupported_attribute(monkeypatch):
+def test_model_version_filter_parser_rejects_unsupported_attribute(store, monkeypatch):
     monkeypatch.setattr(
         SearchModelVersionUtils,
         "parse_search_filter",
@@ -213,7 +214,7 @@ def test_model_version_filter_parser_rejects_unsupported_attribute(monkeypatch):
         MlflowException,
         match="Invalid attribute name: unknown_attribute",
     ) as exc_info:
-        MongoDBModelRegistryStore._parse_model_version_filters("name = 'model'")
+        store._parse_model_version_filters("name = 'model'")
 
     assert exc_info.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
 

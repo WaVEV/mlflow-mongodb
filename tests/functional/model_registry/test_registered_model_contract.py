@@ -11,10 +11,33 @@ from mlflow.protos.databricks_pb2 import (
 )
 
 from mlflow_mongodb import MongoDBModelRegistryStore
+from mlflow_mongodb.model_registry.errors import RegisteredModelNotFoundError
 
 
 def _latest_versions_by_stage(versions):
     return {version.current_stage: version.version for version in versions}
+
+
+@pytest.mark.parametrize("operation", ["allocate_next_version", "touch"])
+def test_registered_model_repository_operations_reject_deleted_model(
+    store: MongoDBModelRegistryStore,
+    operation,
+):
+    name = f"{operation}-deleted-model"
+    store.create_registered_model(name)
+    repository = store._registered_model_repository
+    model = repository.find_by_name(name)
+    assert model is not None
+    store.delete_registered_model(name)
+
+    with pytest.raises(RegisteredModelNotFoundError) as caught:
+        getattr(repository, operation)(
+            model_id=model.model_id,
+            last_updated_timestamp=model.last_updated_timestamp + 1,
+        )
+
+    assert caught.value.args == (str(model.model_id),)
+    assert repository.find_by_name(name) is None
 
 
 def test_registered_model_create_get_and_update_contract(

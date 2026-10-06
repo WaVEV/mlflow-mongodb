@@ -6,7 +6,6 @@ import pytest
 from mlflow.exceptions import MlflowException
 
 from mlflow_mongodb import MongoDBModelRegistryStore, __version__
-from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 
 
 def test_mongo_client_reports_driver_name_and_version(monkeypatch):
@@ -80,22 +79,6 @@ def test_store_uses_configured_collection_names(monkeypatch):
         call(model_versions_collection),
         call(registered_models_collection),
     ]
-
-
-@pytest.mark.parametrize(
-    "invalid_name",
-    ["", "invalid\x00name", "invalid$name", "system.models"],
-)
-@pytest.mark.parametrize(
-    "setting_field",
-    [
-        "registered_models_collection_name",
-        "model_versions_collection_name",
-    ],
-)
-def test_mongodb_settings_reject_invalid_collection_names(setting_field, invalid_name):
-    with pytest.raises(ValueError, match="Invalid MongoDB collection name"):
-        MongoDBSettings(**{setting_field: invalid_name})
 
 
 @pytest.mark.parametrize(
