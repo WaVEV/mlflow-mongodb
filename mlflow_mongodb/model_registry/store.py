@@ -309,7 +309,7 @@ class MongoDBModelRegistryStore(AbstractStore):
                 else:
                     message = (
                         f"Invalid comparator '{exc.comparator}' not one of "
-                        f"'{SearchModelUtils.VALID_TAG_COMPARATORS}"
+                        f"'{SearchModelUtils.VALID_TAG_COMPARATORS}'"
                     )
                 raise MlflowException.invalid_parameter_value(message) from None
             filters.append(
