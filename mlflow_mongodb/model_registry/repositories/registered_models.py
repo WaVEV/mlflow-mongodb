@@ -16,7 +16,7 @@ from mlflow_mongodb.infrastructure.array_operations import (
     build_remove_array_element_update,
     build_replace_array_element_pipeline,
 )
-from mlflow_mongodb.infrastructure.search_filters import like_regex
+from mlflow_mongodb.infrastructure.search_filters import build_value_condition
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 from mlflow_mongodb.model_registry.errors import (
     RegisteredModelAlreadyExistsError,
@@ -668,11 +668,7 @@ class RegisteredModelRepository:
 
     @staticmethod
     def _build_value_condition(comparator: str, value: str):
-        if comparator == "=":
-            return value
-        if comparator == "!=":
-            return {"$ne": value}
-        if comparator not in ("LIKE", "ILIKE"):
+        if comparator not in ("=", "!=", "LIKE", "ILIKE"):
             raise ValueError(f"Unsupported registered-model comparator: {comparator}")
 
-        return like_regex(value, comparator)
+        return build_value_condition(comparator, value)

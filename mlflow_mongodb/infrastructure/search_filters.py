@@ -1,9 +1,10 @@
-"""Shared search-filter validation and LIKE pattern construction."""
+"""Shared search-filter validation and MongoDB value-condition construction."""
 
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from mlflow_mongodb.infrastructure.errors import (
@@ -12,6 +13,26 @@ from mlflow_mongodb.infrastructure.errors import (
     RepositoryUnsupportedComparatorError,
     RepositoryUnsupportedFieldTypeError,
 )
+
+COMPARISON_OPERATORS = MappingProxyType(
+    {"=": "$eq", "!=": "$ne", "<": "$lt", "<=": "$lte", ">": "$gt", ">=": "$gte"}
+)
+
+
+def build_value_condition(
+    comparator: str,
+    value: str | int | float | tuple[str, ...],
+) -> str | int | float | tuple[str, ...] | dict[str, Any] | re.Pattern[str]:
+    """Translate a supported comparator and value into a MongoDB condition."""
+    if comparator == "=":
+        return value
+    if comparator in COMPARISON_OPERATORS:
+        return {COMPARISON_OPERATORS[comparator]: value}
+    if comparator == "IN":
+        return {"$in": list(value)}
+    if comparator in ("LIKE", "ILIKE"):
+        return like_regex(str(value), comparator)
+    raise ValueError(f"Unsupported comparator: {comparator}")
 
 
 def like_regex(value: str, comparator: str) -> re.Pattern[str]:

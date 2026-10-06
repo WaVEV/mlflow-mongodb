@@ -19,7 +19,7 @@ from mlflow_mongodb.infrastructure.array_operations import (
     build_remove_array_element_update,
     build_replace_array_element_pipeline,
 )
-from mlflow_mongodb.infrastructure.search_filters import like_regex
+from mlflow_mongodb.infrastructure.search_filters import build_value_condition
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 from mlflow_mongodb.model_registry.errors import (
     ModelVersionAlreadyExistsError,
@@ -744,24 +744,10 @@ class ModelVersionRepository:
         comparator: str,
         value: str | int | float | tuple[str, ...],
     ):
-        if comparator == "=":
-            return value
-        if comparator == "!=":
-            return {"$ne": value}
-        if comparator == "IN":
-            return {"$in": list(value)}
-        numeric_operators = {
-            ">": "$gt",
-            ">=": "$gte",
-            "<": "$lt",
-            "<=": "$lte",
-        }
-        if comparator in numeric_operators:
-            return {numeric_operators[comparator]: value}
-        if comparator not in ("LIKE", "ILIKE"):
+        if comparator not in ("=", "!=", "IN", ">", ">=", "<", "<=", "LIKE", "ILIKE"):
             raise ValueError(f"Unsupported model-version comparator: {comparator}")
 
-        return like_regex(str(value), comparator)
+        return build_value_condition(comparator, value)
 
     @staticmethod
     def _combine_clauses(clauses: Sequence[dict[str, Any]]) -> dict[str, Any]:
