@@ -293,6 +293,7 @@ class MongoDBTrackingStore(AbstractStore):
 
     @handle_persistence_error("Unable to delete experiment.", logger=logger)
     def delete_experiment(self, experiment_id: str) -> None:
+        experiment_id = None if experiment_id is None else str(experiment_id)
         try:
             self._experiment_repository.mark_deleted(
                 experiment_id=experiment_id,
@@ -306,6 +307,7 @@ class MongoDBTrackingStore(AbstractStore):
 
     @handle_persistence_error("Unable to restore experiment.", logger=logger)
     def restore_experiment(self, experiment_id: str) -> None:
+        experiment_id = None if experiment_id is None else str(experiment_id)
         try:
             self._experiment_repository.restore(
                 experiment_id=experiment_id,
