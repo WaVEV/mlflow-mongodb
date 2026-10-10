@@ -107,8 +107,8 @@ def test_parse_model_version_prompt_filter_controls_exclusion(
         ),
         (
             "_parse_model_version_filters",
-            "name IN ('fraud', 'credit')",
-            "Only the 'run_id' attribute",
+            "source_path IN ('fraud', 'credit')",
+            "comparison with a list of quoted string values",
         ),
         (
             "_parse_model_version_filters",
