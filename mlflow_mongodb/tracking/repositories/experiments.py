@@ -78,18 +78,15 @@ class ExperimentRepository:
             elif search_filter.comparator == "IS NOT NULL":
                 clauses.append({"tags": {"$elemMatch": {"k": search_filter.key}}})
             else:
-                clauses.append(
-                    {
-                        "tags": {
-                            "$elemMatch": {
-                                "k": search_filter.key,
-                                "v": self._value_condition(
-                                    search_filter.comparator, search_filter.value
-                                ),
-                            }
-                        }
+                tag_match = {
+                    "k": search_filter.key,
+                    "v": self._value_condition(search_filter.comparator, search_filter.value),
+                }
+                if search_filter.comparator == "!=":
+                    tag_match = {
+                        "$and": [tag_match, {"v": {"$ne": None}}],
                     }
-                )
+                clauses.append({"tags": {"$elemMatch": tag_match}})
         sort_fields = [
             (
                 "_id" if order.key == "experiment_id" else order.key,
