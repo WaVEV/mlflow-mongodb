@@ -14,7 +14,7 @@ from mlflow.utils.validation import (
     MAX_EXPERIMENT_TAG_VAL_LENGTH,
 )
 
-from mlflow_mongodb.tracking.errors import (
+from mlflow_mongodb.infrastructure.errors import (
     RepositoryAlreadyExistsError,
     RepositoryNotActiveError,
     RepositoryNotFoundError,

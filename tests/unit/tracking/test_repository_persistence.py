@@ -4,9 +4,11 @@ import pytest
 from pymongo import ASCENDING, DESCENDING
 from pymongo.errors import DuplicateKeyError, OperationFailure
 
-from mlflow_mongodb.infrastructure.errors import RepositoryPersistenceError
+from mlflow_mongodb.infrastructure.errors import (
+    RepositoryAlreadyExistsError,
+    RepositoryPersistenceError,
+)
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
-from mlflow_mongodb.tracking.errors import RepositoryAlreadyExistsError
 from mlflow_mongodb.tracking.repositories import ExperimentRepository
 from mlflow_mongodb.tracking.repositories.experiments import ExperimentFilter, ExperimentOrder
 

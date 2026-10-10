@@ -29,7 +29,10 @@ from pymongo.database import Database
 from pymongo.errors import ConfigurationError
 
 from mlflow_mongodb.infrastructure.errors import (
+    RepositoryAlreadyExistsError,
     RepositoryInvalidAttributeError,
+    RepositoryNotActiveError,
+    RepositoryNotFoundError,
     RepositoryUnsupportedComparatorError,
     RepositoryUnsupportedFieldTypeError,
 )
@@ -39,11 +42,6 @@ from mlflow_mongodb.infrastructure.search_filters import (
 )
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 from mlflow_mongodb.infrastructure.store_errors import handle_persistence_error
-from mlflow_mongodb.tracking.errors import (
-    RepositoryAlreadyExistsError,
-    RepositoryNotActiveError,
-    RepositoryNotFoundError,
-)
 from mlflow_mongodb.tracking.repositories import ExperimentRepository
 from mlflow_mongodb.tracking.repositories.experiments import ExperimentFilter, ExperimentOrder
 
