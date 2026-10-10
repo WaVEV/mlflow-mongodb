@@ -4,16 +4,6 @@ from collections.abc import Mapping
 from typing import Any
 
 
-def build_array_value_expression(field: str, key: str) -> dict[str, Any]:
-    """Read a value by key from an embedded ``{k, v}`` array expression."""
-    return {
-        "$getField": {
-            "field": {"$literal": key},
-            "input": {"$arrayToObject": {"$ifNull": [field, []]}},
-        }
-    }
-
-
 def build_merge_array_expression(
     field: str,
     records: list[Mapping[str, Any]],
