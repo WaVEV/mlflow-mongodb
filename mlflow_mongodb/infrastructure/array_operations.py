@@ -1,4 +1,4 @@
-"""Private MongoDB array expression and update helpers shared by both stores."""
+"""Internal MongoDB update builders for repository documents."""
 
 from collections.abc import Mapping
 from typing import Any
