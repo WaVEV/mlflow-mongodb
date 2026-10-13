@@ -98,56 +98,11 @@ from mlflow_mongodb.tracking.repositories import (
     RunRepository,
 )
 from mlflow_mongodb.tracking.repositories.experiments import ExperimentFilter, ExperimentOrder
-from mlflow_mongodb.tracking.repositories.runs import RunFilter, RunOrder
-from mlflow_mongodb.tracking.types import RunRecord
-
 from mlflow_mongodb.tracking.repositories.logged_models import LoggedModelFilter, LoggedModelOrder
-from mlflow_mongodb.tracking.types import LoggedModelRecord, RunMetricRecord
+from mlflow_mongodb.tracking.repositories.runs import RunFilter, RunOrder
+from mlflow_mongodb.tracking.types import LoggedModelRecord, RunMetricRecord, RunRecord
 
 logger = logging.getLogger(__name__)
-
-
-def _normalize_logged_model_search_key(key: str) -> str:
-    # The SQL-backed MLflow parser emits these names for timestamp aliases.
-    if key in ("creation_timestamp_ms", "last_updated_timestamp_ms"):
-        return key.removesuffix("_ms")
-    return key
-
-
-
-def _stored_logged_model_attribute_key(key: str) -> str:
-    if key == "creation_time":
-        return "creation_timestamp"
-    if key == "last_updated_time":
-        return "last_updated_timestamp"
-    return key
-
-
-
-def _is_numeric_logged_model_filter(clause: SearchFilterClause) -> bool:
-    # Preserve classification after the existing attribute-to-storage key translation.
-    return clause.field_type == "metric" or (
-        clause.field_type == "attribute"
-        and _stored_logged_model_attribute_key(clause.key)
-        in SearchLoggedModelsUtils.NUMERIC_ATTRIBUTES
-    )
-
-
-
-def _validate_logged_model_filter_value(clause: SearchFilterClause) -> None:
-    if not clause.key:
-        raise RepositoryEmptySearchKeyError("Search key must not be empty.")
-    if _is_numeric_logged_model_filter(clause):
-        if not isinstance(clause.value, (int, float)) or not math.isfinite(clause.value):
-            raise RepositoryInvalidFilterValueError("finite numbers")
-    elif clause.comparator in ("IN", "NOT IN"):
-        if not isinstance(clause.value, (list, tuple)) or not all(
-            isinstance(value, str) for value in clause.value
-        ):
-            raise RepositoryInvalidFilterValueError("a list of string values")
-    elif not isinstance(clause.value, str):
-        raise RepositoryInvalidFilterValueError("string values")
-
 
 
 class MongoDBTrackingStore(AbstractStore):
@@ -975,7 +930,6 @@ class MongoDBTrackingStore(AbstractStore):
     def _logged_model_repository(self) -> LoggedModelRepository:
         return LoggedModelRepository(self._database, settings=self._settings)
 
-
     @handle_persistence_error("Unable to create logged model.", logger=logger)
     def create_logged_model(
         self,
@@ -1033,7 +987,6 @@ class MongoDBTrackingStore(AbstractStore):
 
         return self._to_logged_model(record)
 
-
     @staticmethod
     def _to_logged_model(
         record: LoggedModelRecord, metrics: tuple[RunMetricRecord, ...] = ()
@@ -1067,11 +1020,48 @@ class MongoDBTrackingStore(AbstractStore):
             or None,
         )
 
+    @staticmethod
+    def _normalize_logged_model_search_key(key: str) -> str:
+        if key in ("creation_timestamp_ms", "last_updated_timestamp_ms"):
+            return key.removesuffix("_ms")
+        return key
+
+    @staticmethod
+    def _stored_logged_model_attribute_key(key: str) -> str:
+        if key == "creation_time":
+            return "creation_timestamp"
+        if key == "last_updated_time":
+            return "last_updated_timestamp"
+        return key
+
+    @staticmethod
+    def _is_numeric_logged_model_filter(clause: SearchFilterClause) -> bool:
+        # Preserve classification after the existing attribute-to-storage key translation.
+        return clause.field_type == "metric" or (
+            clause.field_type == "attribute"
+            and MongoDBTrackingStore._stored_logged_model_attribute_key(clause.key)
+            in SearchLoggedModelsUtils.NUMERIC_ATTRIBUTES
+        )
+
+    @staticmethod
+    def _validate_logged_model_filter_value(clause: SearchFilterClause) -> None:
+        if not clause.key:
+            raise RepositoryEmptySearchKeyError("Search key must not be empty.")
+        if MongoDBTrackingStore._is_numeric_logged_model_filter(clause):
+            if not isinstance(clause.value, (int, float)) or not math.isfinite(clause.value):
+                raise RepositoryInvalidFilterValueError("finite numbers")
+        elif clause.comparator in ("IN", "NOT IN"):
+            if not isinstance(clause.value, (list, tuple)) or not all(
+                isinstance(value, str) for value in clause.value
+            ):
+                raise RepositoryInvalidFilterValueError("a list of string values")
+        elif not isinstance(clause.value, str):
+            raise RepositoryInvalidFilterValueError("string values")
 
     @staticmethod
     def _logged_model_attribute_key(key: str, *, order_by: bool = False) -> str:
         # MLflow's filter parser emits SQL timestamp names; MongoDB stores entity names.
-        key = _normalize_logged_model_search_key(key)
+        key = MongoDBTrackingStore._normalize_logged_model_search_key(key)
         valid_keys = (
             SearchLoggedModelsUtils.VALID_ORDER_BY_ATTRIBUTE_KEYS
             if order_by
@@ -1081,8 +1071,7 @@ class MongoDBTrackingStore(AbstractStore):
             raise MlflowException.invalid_parameter_value(
                 f"Invalid logged model attribute: {key!r}."
             )
-        return _stored_logged_model_attribute_key(key)
-
+        return MongoDBTrackingStore._stored_logged_model_attribute_key(key)
 
     @staticmethod
     def _validate_logged_model_datasets(datasets: list[dict[str, Any]] | None) -> None:
@@ -1105,7 +1094,6 @@ class MongoDBTrackingStore(AbstractStore):
                     "Dataset names and digests must be strings."
                 )
 
-
     @cached_property
     def _logged_model_filter_validator(self) -> SearchFilterValidator:
         # parse_filter_string already validates operators with Entity.validate_op; its rules
@@ -1113,10 +1101,9 @@ class MongoDBTrackingStore(AbstractStore):
         return ConfiguredSearchFilterValidator(
             field_types=("attribute", "metric", "param", "tag"),
             attribute_keys=SearchLoggedModelsUtils.VALID_SEARCH_ATTRIBUTE_KEYS,
-            rules=(_validate_logged_model_filter_value,),
+            rules=(self._validate_logged_model_filter_value,),
             uppercase_comparators=False,
         )
-
 
     def _parse_logged_model_filters(
         self, filter_string: str | None
@@ -1141,7 +1128,7 @@ class MongoDBTrackingStore(AbstractStore):
             field_type = comparison.entity.type.name.lower()
             key = comparison.entity.key
             if field_type == "attribute":
-                key = _normalize_logged_model_search_key(key)
+                key = self._normalize_logged_model_search_key(key)
             parsed = {
                 "type": field_type,
                 "key": key,
@@ -1175,18 +1162,17 @@ class MongoDBTrackingStore(AbstractStore):
                 raise MlflowException.invalid_parameter_value(messages[exc.expected]) from None
 
             key = (
-                _stored_logged_model_attribute_key(clause.key)
+                self._stored_logged_model_attribute_key(clause.key)
                 if clause.field_type == "attribute"
                 else clause.key
             )
             value = clause.value
-            if clause.comparator in ("IN", "NOT IN") and not _is_numeric_logged_model_filter(
+            if clause.comparator in ("IN", "NOT IN") and not self._is_numeric_logged_model_filter(
                 clause
             ):
                 value = tuple(value)
             filters.append(LoggedModelFilter(clause.field_type, key, clause.comparator, value))
         return tuple(filters)
-
 
     @classmethod
     def _parse_logged_model_order(
@@ -1260,7 +1246,6 @@ class MongoDBTrackingStore(AbstractStore):
             raise MlflowException.invalid_parameter_value("Too many order_by fields.")
         return tuple(orders)
 
-
     @staticmethod
     def _parse_logged_model_page_token(
         page_token: str | None,
@@ -1287,7 +1272,6 @@ class MongoDBTrackingStore(AbstractStore):
             raise MlflowException.invalid_parameter_value("Invalid logged model page token offset.")
         token.validate(experiment_ids, filter_string or None, order_by or None)
         return token.offset
-
 
     @handle_persistence_error("Unable to search logged models.", logger=logger)
     def search_logged_models(
@@ -1347,7 +1331,6 @@ class MongoDBTrackingStore(AbstractStore):
             next_token,
         )
 
-
     @handle_persistence_error("Unable to get logged model.", logger=logger)
     def get_logged_model(self, model_id: str, allow_deleted: bool = False) -> LoggedModel:
         """Fetch model metadata and its complete associated metric history."""
@@ -1362,7 +1345,6 @@ class MongoDBTrackingStore(AbstractStore):
 
         return self._to_logged_model(record, metrics)
 
-
     @handle_persistence_error("Unable to delete logged model.", logger=logger)
     def delete_logged_model(self, model_id: str) -> None:
         """Soft-delete a logged model and refresh its last-updated timestamp."""
@@ -1376,7 +1358,6 @@ class MongoDBTrackingStore(AbstractStore):
             raise MlflowException(
                 f"Logged model with ID '{model_id}' not found.", RESOURCE_DOES_NOT_EXIST
             ) from None
-
 
     @handle_persistence_error("Unable to set logged model tags.", logger=logger)
     def set_logged_model_tags(self, model_id: str, tags: list[LoggedModelTag]) -> None:
@@ -1394,7 +1375,6 @@ class MongoDBTrackingStore(AbstractStore):
                 f"Logged model with ID '{model_id}' not found.", RESOURCE_DOES_NOT_EXIST
             ) from None
 
-
     @handle_persistence_error("Unable to delete logged model tag.", logger=logger)
     def delete_logged_model_tag(self, model_id: str, key: str) -> None:
         """Delete a model tag, failing if the model or tag does not exist."""
@@ -1411,4 +1391,3 @@ class MongoDBTrackingStore(AbstractStore):
                 f"No tag with key {key!r} found for model with ID {model_id!r}.",
                 RESOURCE_DOES_NOT_EXIST,
             ) from None
-
