@@ -2,13 +2,13 @@
 
 import base64
 import json
-from types import SimpleNamespace
 
 import pytest
 from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE, ErrorCode
 from mlflow.utils.search_utils import SearchLoggedModelsPaginationToken
 
+from mlflow_mongodb.infrastructure.errors import RepositoryInvalidAttributeError
 from mlflow_mongodb.tracking.repositories import (
     LoggedModelFilter,
     LoggedModelOrder,
@@ -34,15 +34,6 @@ from mlflow_mongodb.tracking.types import RunMetricRecord
             "last_updated_timestamp < 2000",
             LoggedModelFilter("attribute", "last_updated_timestamp", "<", 2000.0),
         ),
-        pytest.param(
-            "last_updated_time < 2000",
-            LoggedModelFilter("attribute", "last_updated_timestamp", "<", 2000.0),
-            marks=pytest.mark.xfail(
-                strict=True,
-                raises=MlflowException,
-                reason="MLflow's SQL-backed parser does not classify last_updated_time as numeric",
-            ),
-        ),
         ("metrics.`loss.test` > 0.1", LoggedModelFilter("metric", "loss.test", ">", 0.1)),
         ("tags.`team.name` ILIKE 'risk%'", LoggedModelFilter("tag", "team.name", "ILIKE", "risk%")),
         ("params.depth IN ('3', '4')", LoggedModelFilter("param", "depth", "IN", ("3", "4"))),
@@ -61,7 +52,6 @@ def test_filters_are_parsed_into_repository_clauses(
     [
         "metrics.loss > nan",
         "metrics.loss > inf",
-        "unknown = 'value'",
         "metrics.loss LIKE 'x'",
         "params.depth > '3'",
         "name = 'a' OR name = 'b'",
@@ -77,29 +67,76 @@ def test_invalid_filters_are_rejected_before_repository_call(
 
 
 @pytest.mark.parametrize(
-    "field_type,key,operator,value",
+    "expression,error_type",
     [
-        ("TAG", "", "=", "value"),
-        ("METRIC", "loss", "=", "1"),
-        ("METRIC", "loss", "=", float("nan")),
-        ("TAG", "team", "IN", "risk"),
-        ("PARAM", "depth", "IN", [1]),
-        ("TAG", "team", "=", 1),
+        ("metrics.loss = 'abc'", ValueError),
+        ("params.depth IN (unknown)", ValueError),
+        ("params.depth IN (1,,2)", SyntaxError),
     ],
 )
-def test_domain_rules_validate_parser_output(
-    logged_model_store, logged_model_repository, monkeypatch, field_type, key, operator, value
+def test_search_rejects_invalid_filter_literals(
+    logged_model_store, logged_model_repository, caplog, expression, error_type
 ):
-    import mlflow.utils.search_logged_model_utils as parser
-
-    comparison = SimpleNamespace(
-        entity=SimpleNamespace(type=SimpleNamespace(name=field_type), key=key),
-        op=operator,
-        value=value,
-    )
-    monkeypatch.setattr(parser, "parse_filter_string", lambda _: [comparison])
     with pytest.raises(MlflowException) as caught:
-        logged_model_store.search_logged_models(["42"], filter_string="injected")
+        logged_model_store.search_logged_models(["42"], filter_string=expression)
+
+    assert caught.value.message == "Invalid logged model filter string."
+    assert caught.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__ is True
+    logged_model_repository.search.assert_not_called()
+    records = [
+        record for record in caplog.records if record.name == "mlflow_mongodb.tracking.store"
+    ]
+    assert len(records) == 1
+    assert records[0].msg == "Unable to parse logged model filter: %s"
+    assert isinstance(records[0].args[0], error_type)
+    assert records[0].exc_info is None
+
+
+def test_search_rejects_invalid_attributes(logged_model_store, logged_model_repository, caplog):
+    with pytest.raises(MlflowException) as caught:
+        logged_model_store.search_logged_models(
+            ["42"], filter_string="unsupported_attribute = 'value'"
+        )
+
+    assert caught.value.message == "Invalid logged model attribute: 'unsupported_attribute'."
+    assert caught.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__ is True
+    logged_model_repository.search.assert_not_called()
+    records = [
+        record for record in caplog.records if record.name == "mlflow_mongodb.tracking.store"
+    ]
+    assert len(records) == 1
+    assert records[0].msg == "Unable to validate logged model filter: %s"
+    assert isinstance(records[0].args[0], RepositoryInvalidAttributeError)
+    assert records[0].args[0].key == "unsupported_attribute"
+    assert records[0].exc_info is None
+
+
+def test_empty_tag_key_is_rejected(logged_model_store, logged_model_repository):
+    with pytest.raises(MlflowException, match="Search keys must not be empty") as caught:
+        logged_model_store.search_logged_models(["42"], filter_string="tags.`` = 'value'")
+    assert caught.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
+    assert caught.value.__cause__ is None
+    logged_model_repository.search.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "expression,message",
+    [
+        ("last_updated_time = 2000", "Numeric filters require finite numbers"),
+        ("params.depth IN (1, 2)", "IN and NOT IN require a list of string values"),
+        ("params.depth IN (1)", "IN and NOT IN require a list of string values"),
+        ("tags.team = (1)", "String filters require string values"),
+    ],
+)
+def test_invalid_filter_values_are_rejected(
+    logged_model_store, logged_model_repository, expression, message
+):
+    with pytest.raises(MlflowException, match=message) as caught:
+        logged_model_store.search_logged_models(["42"], filter_string=expression)
     assert caught.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
     assert caught.value.__cause__ is None
     logged_model_repository.search.assert_not_called()

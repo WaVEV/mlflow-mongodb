@@ -173,14 +173,12 @@ class LoggedModelTagRecord:
     value: str
 
 
-
 @dataclass(frozen=True)
 class LoggedModelParameterRecord:
     """Stored logged-model parameter data."""
 
     key: str
     value: str
-
 
 
 @dataclass(frozen=True)
@@ -220,4 +218,3 @@ class LoggedModelRecord:
                 LoggedModelParameterRecord(param["k"], param["v"]) for param in document["params"]
             ),
         )
-

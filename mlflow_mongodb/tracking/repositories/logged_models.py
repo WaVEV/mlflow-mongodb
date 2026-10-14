@@ -13,14 +13,13 @@ from mlflow_mongodb.infrastructure.array_operations import (
     build_merge_array_expression,
     build_remove_array_element_update,
 )
-
-from mlflow_mongodb.infrastructure.repository_operations import repository_operation
-from mlflow_mongodb.infrastructure.search_filters import COMPARISON_OPERATORS, like_regex
-from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 from mlflow_mongodb.infrastructure.errors import (
     RepositoryNotFoundError,
     RepositoryTagNotFoundError,
 )
+from mlflow_mongodb.infrastructure.repository_operations import repository_operation
+from mlflow_mongodb.infrastructure.search_filters import COMPARISON_OPERATORS, like_regex
+from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 from mlflow_mongodb.tracking.types import LoggedModelRecord, RunMetricRecord
 
 
@@ -238,9 +237,11 @@ class LoggedModelRepository:
         pipeline.extend(self._metric_stages(metric_filters, datasets, order_by))
         pipeline.extend(self._order_stages(order_by))
         pipeline.extend([{"$skip": offset}, {"$limit": max_results + 1}])
-        with repository_operation("Unable to search logged models."):
-            with self._collection.aggregate(pipeline, allowDiskUse=True) as cursor:
-                documents = list(cursor)
+        with (
+            repository_operation("Unable to search logged models."),
+            self._collection.aggregate(pipeline) as cursor,
+        ):
+            documents = list(cursor)
         page_documents = documents[:max_results]
 
         metrics_by_model = self._get_metrics_by_model(
@@ -261,7 +262,7 @@ class LoggedModelRepository:
     def _get_metrics_by_model(
         self, model_ids: Sequence[str]
     ) -> dict[str, tuple[RunMetricRecord, ...]]:
-        """Load metric histories for model retrieval and search in a consistent order."""
+        """Load metric histories for model retrieval."""
         # A separate batched read avoids joining an unbounded metric array into
         # each aggregation result, which would be subject to the BSON size limit.
         metrics_by_model = defaultdict(list)

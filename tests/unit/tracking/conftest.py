@@ -137,7 +137,9 @@ def logged_model_document_factory():
             "_id": f"m-{UUID(int=42).hex}",
             "experiment_id": EXPERIMENT_ID,
             "name": "example-model",
-            "artifact_location": f"{ARTIFACT_URI}/{EXPERIMENT_ID}/models/m-{UUID(int=42).hex}/artifacts",
+            "artifact_location": (
+                f"{ARTIFACT_URI}/{EXPERIMENT_ID}/models/m-{UUID(int=42).hex}/artifacts"
+            ),
             "creation_timestamp": FIXED_TIMESTAMP,
             "last_updated_timestamp": FIXED_TIMESTAMP,
             "status": "PENDING",
