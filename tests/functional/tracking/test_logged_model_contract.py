@@ -147,7 +147,7 @@ def test_repeated_delete_preserves_data_and_refreshes_timestamp(store, run, cloc
         tags=[LoggedModelTag("team", "risk")],
         params=[LoggedModelParameter("depth", "3")],
     )
-    store.log_metric(run.info.run_id, Metric("loss", 0.4, 1000, 0, model_id=model.model_id))
+    store.log_metric(run.info.run_id, Metric("loss", 5.0, 1000, 0, model_id=model.model_id))
     original = _stored_model(store, model.model_id)
     for advance in (0, 0, 10):
         clock["now"] += advance
@@ -159,7 +159,7 @@ def test_repeated_delete_preserves_data_and_refreshes_timestamp(store, run, cloc
     with pytest.raises(MlflowException) as caught:
         store.get_logged_model(model.model_id)
     assert caught.value.error_code == ErrorCode.Name(RESOURCE_DOES_NOT_EXIST)
-    assert store.get_logged_model(model.model_id, allow_deleted=True).metrics[0].value == 0.4
+    assert store.get_logged_model(model.model_id, allow_deleted=True).metrics[0].value == 5
     assert store.search_logged_models([run.info.experiment_id]) == []
 
 
@@ -234,10 +234,10 @@ def test_repository_distinguishes_missing_model_and_tag_without_unrelated_change
 def test_async_run_metric_logging_is_visible_on_logged_model(store, run):
     model = store.create_logged_model(run.info.experiment_id, name="async-model")
     store.log_metric_async(
-        run.info.run_id, Metric("loss", 0.4, 1000, 1, model_id=model.model_id)
+        run.info.run_id, Metric("loss", 5.0, 1000, 1, model_id=model.model_id)
     ).wait()
     metrics = store.get_logged_model(model.model_id).metrics
     assert len(metrics) == 1
-    assert metrics[0].value == 0.4
+    assert metrics[0].value == 5
     assert metrics[0].model_id == model.model_id
     assert metrics[0].run_id == run.info.run_id

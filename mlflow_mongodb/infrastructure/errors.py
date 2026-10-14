@@ -64,7 +64,6 @@ class RepositoryEmptySearchKeyError(Exception):
     """Raised when a filter has an empty key."""
 
 
-
 class RepositoryInvalidFilterValueError(Exception):
     """Raised when a filter value does not have its required type or range."""
 
@@ -75,7 +74,5 @@ class RepositoryInvalidFilterValueError(Exception):
         super().__init__(f"Search filter requires {expected}")
 
 
-
 class RepositoryTagNotFoundError(Exception):
     """Raised when a requested tag is missing from an existing resource."""
-

@@ -29,17 +29,6 @@ MODEL_ID = f"m-{UUID(int=42).hex}"
 TIMESTAMP = 1_700_000_000_000
 
 
-def _invoke(store, operation):
-    return {
-        "create_logged_model": lambda: store.create_logged_model("42", name="example-model"),
-        "get_logged_model": lambda: store.get_logged_model(MODEL_ID),
-        "delete_logged_model": lambda: store.delete_logged_model(MODEL_ID),
-        "set_logged_model_tags": lambda: store.set_logged_model_tags(MODEL_ID, []),
-        "delete_logged_model_tag": lambda: store.delete_logged_model_tag(MODEL_ID, "team"),
-        "search_logged_models": lambda: store.search_logged_models(["42"]),
-    }[operation]()
-
-
 @pytest.mark.parametrize("name", ["named", None])
 def test_create_builds_pending_model_and_artifact_path(
     logged_model_store, logged_model_repository, logged_model_record_factory, monkeypatch, name
@@ -208,20 +197,30 @@ def test_set_tags_rejects_null_entries(logged_model_store, logged_model_reposito
 
 
 @pytest.mark.parametrize(
-    "operation,method,error",
+    "operation,args,method,error",
     [
-        ("delete_logged_model", "mark_deleted", RepositoryNotFoundError("private")),
-        ("set_logged_model_tags", "set_tags", RepositoryNotFoundError("private")),
-        ("delete_logged_model_tag", "delete_tag", RepositoryNotFoundError("private")),
-        ("delete_logged_model_tag", "delete_tag", RepositoryTagNotFoundError("private")),
+        ("delete_logged_model", (MODEL_ID,), "mark_deleted", RepositoryNotFoundError("private")),
+        ("set_logged_model_tags", (MODEL_ID, []), "set_tags", RepositoryNotFoundError("private")),
+        (
+            "delete_logged_model_tag",
+            (MODEL_ID, "team"),
+            "delete_tag",
+            RepositoryNotFoundError("private"),
+        ),
+        (
+            "delete_logged_model_tag",
+            (MODEL_ID, "team"),
+            "delete_tag",
+            RepositoryTagNotFoundError("private"),
+        ),
     ],
 )
 def test_domain_errors_keep_public_code_and_suppress_backend_context(
-    logged_model_store, logged_model_repository, caplog, operation, method, error
+    logged_model_store, logged_model_repository, caplog, operation, args, method, error
 ):
     getattr(logged_model_repository, method).side_effect = error
     with pytest.raises(MlflowException) as caught:
-        _invoke(logged_model_store, operation)
+        getattr(logged_model_store, operation)(*args)
     assert caught.value.error_code == ErrorCode.Name(RESOURCE_DOES_NOT_EXIST)
     assert "private" not in caught.value.message
     assert caught.value.__cause__ is None
@@ -231,24 +230,34 @@ def test_domain_errors_keep_public_code_and_suppress_backend_context(
 
 
 @pytest.mark.parametrize(
-    "operation,method,message",
+    "operation,args,method,message",
     [
-        ("create_logged_model", "create", "Unable to create logged model."),
-        ("get_logged_model", "find_by_id", "Unable to get logged model."),
-        ("get_logged_model", "get_metric_history", "Unable to get logged model."),
-        ("delete_logged_model", "mark_deleted", "Unable to delete logged model."),
-        ("set_logged_model_tags", "set_tags", "Unable to set logged model tags."),
-        ("delete_logged_model_tag", "delete_tag", "Unable to delete logged model tag."),
-        ("search_logged_models", "search", "Unable to search logged models."),
+        (
+            "create_logged_model",
+            ("42", "example-model"),
+            "create",
+            "Unable to create logged model.",
+        ),
+        ("get_logged_model", (MODEL_ID,), "find_by_id", "Unable to get logged model."),
+        ("get_logged_model", (MODEL_ID,), "get_metric_history", "Unable to get logged model."),
+        ("delete_logged_model", (MODEL_ID,), "mark_deleted", "Unable to delete logged model."),
+        ("set_logged_model_tags", (MODEL_ID, []), "set_tags", "Unable to set logged model tags."),
+        (
+            "delete_logged_model_tag",
+            (MODEL_ID, "team"),
+            "delete_tag",
+            "Unable to delete logged model tag.",
+        ),
+        ("search_logged_models", (["42"],), "search", "Unable to search logged models."),
     ],
 )
 def test_persistence_errors_are_sanitized_and_logged_once(
-    logged_model_store, logged_model_repository, caplog, operation, method, message
+    logged_model_store, logged_model_repository, caplog, operation, args, method, message
 ):
     error = RepositoryPersistenceError("Private URI and query")
     getattr(logged_model_repository, method).side_effect = error
     with pytest.raises(MlflowException) as caught:
-        _invoke(logged_model_store, operation)
+        getattr(logged_model_store, operation)(*args)
     assert caught.value.message == message
     assert caught.value.error_code == ErrorCode.Name(INTERNAL_ERROR)
     assert caught.value.__cause__ is None
@@ -260,23 +269,25 @@ def test_persistence_errors_are_sanitized_and_logged_once(
 
 
 @pytest.mark.parametrize(
-    "operation",
+    "operation,args",
     [
-        "create_logged_model",
-        "get_logged_model",
-        "delete_logged_model",
-        "set_logged_model_tags",
-        "delete_logged_model_tag",
-        "search_logged_models",
+        ("create_logged_model", ("42", "example-model")),
+        ("get_logged_model", (MODEL_ID,)),
+        ("delete_logged_model", (MODEL_ID,)),
+        ("set_logged_model_tags", (MODEL_ID, [])),
+        ("delete_logged_model_tag", (MODEL_ID, "team")),
+        ("search_logged_models", (["42"],)),
     ],
 )
-def test_initialization_failure_is_logged_once(logged_model_store, monkeypatch, caplog, operation):
+def test_initialization_failure_is_logged_once(
+    logged_model_store, monkeypatch, caplog, operation, args
+):
     logged_model_store.__dict__.pop("_logged_model_repository")
     logged_model_store.__dict__["_database"] = MagicMock()
     error = RepositoryPersistenceError("Private initialization details")
     monkeypatch.setattr(tracking_store, "LoggedModelRepository", Mock(side_effect=error))
     with pytest.raises(MlflowException) as caught:
-        _invoke(logged_model_store, operation)
+        getattr(logged_model_store, operation)(*args)
     assert caught.value.message == "Unable to initialize logged model repository."
     assert caught.value.error_code == ErrorCode.Name(INTERNAL_ERROR)
     assert caught.value.__cause__ is None

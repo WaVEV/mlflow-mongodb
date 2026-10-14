@@ -1048,7 +1048,9 @@ class MongoDBTrackingStore(AbstractStore):
         if not clause.key:
             raise RepositoryEmptySearchKeyError("Search key must not be empty.")
         if MongoDBTrackingStore._is_numeric_logged_model_filter(clause):
-            if not isinstance(clause.value, (int, float)) or not math.isfinite(clause.value):
+            if clause.field_type == "attribute" and not isinstance(clause.value, (int, float)):
+                raise RepositoryInvalidFilterValueError("finite numbers")
+            if not math.isfinite(clause.value):
                 raise RepositoryInvalidFilterValueError("finite numbers")
         elif clause.comparator in ("IN", "NOT IN"):
             if not isinstance(clause.value, (list, tuple)) or not all(
@@ -1137,11 +1139,6 @@ class MongoDBTrackingStore(AbstractStore):
             }
             try:
                 clause = self._logged_model_filter_validator.validate(parsed)
-            except RepositoryUnsupportedFieldTypeError as exc:
-                logger.error("Unable to validate logged model filter: %s", exc)
-                raise MlflowException.invalid_parameter_value(
-                    f"Invalid logged model search field type: {exc.field_type}"
-                ) from None
             except RepositoryInvalidAttributeError as exc:
                 logger.error("Unable to validate logged model filter: %s", exc)
                 raise MlflowException.invalid_parameter_value(

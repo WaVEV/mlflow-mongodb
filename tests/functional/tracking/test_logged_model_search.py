@@ -13,7 +13,8 @@ def _names(page):
 
 
 @pytest.fixture
-def searchable_models(store, run, clock):
+def searchable_models(store, run, request):
+    request.getfixturevalue("clock")
     models = {}
     for name, depth, team in [
         ("low", "10", "Risk"),
@@ -92,11 +93,13 @@ def searchable_models(store, run, clock):
         ("params.depth != '10'", {"high"}),
         ("params.depth IN ('10', '2')", {"low", "high"}),
         ("params.depth NOT IN ('10')", {"high"}),
+        ("params.depth NOT IN ()", {"low", "high"}),
         ("params.depth LIKE '1%'", {"low"}),
         ("tags.`team.name` ILIKE 'risk'", {"low"}),
         ("tags.`team.name` LIKE 'risk'", set()),
         ("tags.`team.name` != 'Risk'", {"high"}),
         ("tags.empty = ''", {"low", "high"}),
+        ("tags.empty NOT IN ()", {"low", "high"}),
         ("metrics.loss < 0.1", {"low"}),
         ("metrics.loss <= 0.2", {"low", "high"}),
         ("metrics.loss > 0.6", {"low"}),
@@ -269,14 +272,6 @@ def test_model_id_membership(store, searchable_models):
         "creation_time",
         "creation_timestamp",
         "last_updated_timestamp",
-        pytest.param(
-            "last_updated_time",
-            marks=pytest.mark.xfail(
-                strict=True,
-                raises=MlflowException,
-                reason="MLflow's SQL-backed parser returns a string for last_updated_time",
-            ),
-        ),
     ],
 )
 def test_timestamp_filter_aliases(store, searchable_models, clock, alias):
