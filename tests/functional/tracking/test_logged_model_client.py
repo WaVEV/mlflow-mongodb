@@ -23,7 +23,7 @@ def test_logged_model_lifecycle_tags_metrics_and_search_through_client(store):
     client.log_metric(
         run.info.run_id,
         "loss",
-        0.4,
+        5.0,
         timestamp=1000,
         step=1,
         model_id=model.model_id,
@@ -37,11 +37,11 @@ def test_logged_model_lifecycle_tags_metrics_and_search_through_client(store):
     assert loaded.model_type == "classifier"
     assert loaded.tags == {"team.name": "$platform"}
     assert loaded.params == {"depth": "3"}
-    assert loaded.metrics[0].value == 0.4
+    assert loaded.metrics[0].value == 5
     assert loaded.metrics[0].run_id == run.info.run_id
     page = client.search_logged_models(
         [experiment_id],
-        filter_string="metrics.loss < 0.5 AND params.depth = '3'",
+        filter_string="metrics.loss < 6 AND params.depth = '3'",
         order_by=[{"field_name": "metrics.loss", "ascending": False}],
         max_results=1,
     )

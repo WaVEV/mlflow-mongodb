@@ -124,27 +124,53 @@ def test_create_persists_k_v_arrays_and_initial_metadata(repository, collections
     assert "metrics" not in document
 
 
-@pytest.mark.parametrize("operation", ["create", "find", "delete", "set_tags", "delete_tag"])
 @pytest.mark.parametrize("error_type", [OperationFailure, InvalidDocument])
-def test_database_operations_translate_failures(repository, collections, operation, error_type):
-    method, invoke = {
-        "create": ("insert_one", lambda: repository.create(**CREATE_ARGS)),
-        "find": ("find_one", lambda: repository.find_by_id(MODEL_ID)),
-        "delete": (
-            "update_one",
-            lambda: repository.mark_deleted(model_id=MODEL_ID, last_updated_timestamp=2000),
-        ),
-        "set_tags": ("update_one", lambda: repository.set_tags(model_id=MODEL_ID, tags={})),
-        "delete_tag": (
-            "find_one_and_update",
-            lambda: repository.delete_tag(model_id=MODEL_ID, key="team"),
-        ),
-    }[operation]
+def test_create_translates_database_failures(repository, collections, error_type):
     failure = error_type("Private database details")
-    getattr(collections["logged_models"], method).side_effect = failure
+    collections["logged_models"].insert_one.side_effect = failure
 
     with pytest.raises(RepositoryPersistenceError) as caught:
-        invoke()
+        repository.create(**CREATE_ARGS)
+    assert caught.value.__cause__ is failure
+
+
+@pytest.mark.parametrize("error_type", [OperationFailure, InvalidDocument])
+def test_find_translates_database_failures(repository, collections, error_type):
+    failure = error_type("Private database details")
+    collections["logged_models"].find_one.side_effect = failure
+
+    with pytest.raises(RepositoryPersistenceError) as caught:
+        repository.find_by_id(MODEL_ID)
+    assert caught.value.__cause__ is failure
+
+
+@pytest.mark.parametrize("error_type", [OperationFailure, InvalidDocument])
+def test_delete_translates_database_failures(repository, collections, error_type):
+    failure = error_type("Private database details")
+    collections["logged_models"].update_one.side_effect = failure
+
+    with pytest.raises(RepositoryPersistenceError) as caught:
+        repository.mark_deleted(model_id=MODEL_ID, last_updated_timestamp=2000)
+    assert caught.value.__cause__ is failure
+
+
+@pytest.mark.parametrize("error_type", [OperationFailure, InvalidDocument])
+def test_set_tags_translates_database_failures(repository, collections, error_type):
+    failure = error_type("Private database details")
+    collections["logged_models"].update_one.side_effect = failure
+
+    with pytest.raises(RepositoryPersistenceError) as caught:
+        repository.set_tags(model_id=MODEL_ID, tags={})
+    assert caught.value.__cause__ is failure
+
+
+@pytest.mark.parametrize("error_type", [OperationFailure, InvalidDocument])
+def test_delete_tag_translates_database_failures(repository, collections, error_type):
+    failure = error_type("Private database details")
+    collections["logged_models"].find_one_and_update.side_effect = failure
+
+    with pytest.raises(RepositoryPersistenceError) as caught:
+        repository.delete_tag(model_id=MODEL_ID, key="team")
     assert caught.value.__cause__ is failure
 
 
@@ -165,23 +191,28 @@ def test_record_conversion_errors_are_not_translated(repository, monkeypatch, fa
     assert caught.value is failure
 
 
-@pytest.mark.parametrize("operation", ["delete", "set_tags"])
-@pytest.mark.parametrize("matched", [0, 1])
-def test_updates_use_matched_count_even_when_unchanged(repository, collections, operation, matched):
-    collections["logged_models"].update_one.return_value = Mock(
-        matched_count=matched, modified_count=0
-    )
-    invoke = (
-        (lambda: repository.mark_deleted(model_id=MODEL_ID, last_updated_timestamp=1000))
-        if operation == "delete"
-        else lambda: repository.set_tags(model_id=MODEL_ID, tags={})
-    )
-    if matched:
-        invoke()
-    else:
-        with pytest.raises(RepositoryNotFoundError) as caught:
-            invoke()
-        assert caught.value.args == (MODEL_ID,)
+def test_delete_succeeds_when_existing_model_is_unchanged(repository, collections):
+    collections["logged_models"].update_one.return_value = Mock(matched_count=1, modified_count=0)
+    repository.mark_deleted(model_id=MODEL_ID, last_updated_timestamp=1000)
+
+
+def test_delete_rejects_missing_model(repository, collections):
+    collections["logged_models"].update_one.return_value = Mock(matched_count=0, modified_count=0)
+    with pytest.raises(RepositoryNotFoundError) as caught:
+        repository.mark_deleted(model_id=MODEL_ID, last_updated_timestamp=1000)
+    assert caught.value.args == (MODEL_ID,)
+
+
+def test_set_tags_succeeds_when_existing_model_is_unchanged(repository, collections):
+    collections["logged_models"].update_one.return_value = Mock(matched_count=1, modified_count=0)
+    repository.set_tags(model_id=MODEL_ID, tags={})
+
+
+def test_set_tags_rejects_missing_model(repository, collections):
+    collections["logged_models"].update_one.return_value = Mock(matched_count=0, modified_count=0)
+    with pytest.raises(RepositoryNotFoundError) as caught:
+        repository.set_tags(model_id=MODEL_ID, tags={})
+    assert caught.value.args == (MODEL_ID,)
 
 
 @pytest.mark.parametrize("document", [None, {"_id": MODEL_ID, "tags": [{"k": "other"}]}])
@@ -203,10 +234,9 @@ def test_delete_existing_tag_succeeds(repository, collections):
     repository.delete_tag(model_id=MODEL_ID, key="team.name")
 
 
-@pytest.mark.parametrize("operation", ["search", "history"])
 @pytest.mark.parametrize("error_type", [OperationFailure, InvalidBSON])
-def test_partial_cursor_failures_are_translated_and_cursor_closed(
-    repository, collections, operation, error_type
+def test_search_partial_cursor_failures_are_translated_and_cursor_closed(
+    repository, collections, error_type
 ):
     failure = error_type("Private deferred cursor details")
 
@@ -216,30 +246,49 @@ def test_partial_cursor_failures_are_translated_and_cursor_closed(
 
     cursor = _cursor([])
     cursor.__iter__.side_effect = documents
-    if operation == "search":
-        collections["logged_models"].aggregate.return_value = cursor
-        invoke = lambda: _search(repository)
-    else:
-        collections["run_metrics"].find.return_value = cursor
-        invoke = lambda: repository.get_metric_history(MODEL_ID)
+    collections["logged_models"].aggregate.return_value = cursor
     with pytest.raises(RepositoryPersistenceError) as caught:
-        invoke()
+        _search(repository)
     assert caught.value.__cause__ is failure
     cursor.__exit__.assert_called_once()
 
 
-@pytest.mark.parametrize("operation", ["search", "history"])
-@pytest.mark.parametrize("error_type", [OperationFailure, InvalidDocument])
-def test_cursor_creation_failures_are_translated(repository, collections, operation, error_type):
-    failure = error_type("Private query details")
-    if operation == "search":
-        collections["logged_models"].aggregate.side_effect = failure
-        invoke = lambda: _search(repository)
-    else:
-        collections["run_metrics"].find.side_effect = failure
-        invoke = lambda: repository.get_metric_history(MODEL_ID)
+@pytest.mark.parametrize("error_type", [OperationFailure, InvalidBSON])
+def test_metric_history_partial_cursor_failures_are_translated_and_cursor_closed(
+    repository, collections, error_type
+):
+    failure = error_type("Private deferred cursor details")
+
+    def documents():
+        yield {}
+        raise failure
+
+    cursor = _cursor([])
+    cursor.__iter__.side_effect = documents
+    collections["run_metrics"].find.return_value = cursor
     with pytest.raises(RepositoryPersistenceError) as caught:
-        invoke()
+        repository.get_metric_history(MODEL_ID)
+    assert caught.value.__cause__ is failure
+    cursor.__exit__.assert_called_once()
+
+
+@pytest.mark.parametrize("error_type", [OperationFailure, InvalidDocument])
+def test_search_cursor_creation_failures_are_translated(repository, collections, error_type):
+    failure = error_type("Private query details")
+    collections["logged_models"].aggregate.side_effect = failure
+    with pytest.raises(RepositoryPersistenceError) as caught:
+        _search(repository)
+    assert caught.value.__cause__ is failure
+
+
+@pytest.mark.parametrize("error_type", [OperationFailure, InvalidDocument])
+def test_metric_history_cursor_creation_failures_are_translated(
+    repository, collections, error_type
+):
+    failure = error_type("Private query details")
+    collections["run_metrics"].find.side_effect = failure
+    with pytest.raises(RepositoryPersistenceError) as caught:
+        repository.get_metric_history(MODEL_ID)
     assert caught.value.__cause__ is failure
 
 
