@@ -7,11 +7,11 @@ from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import INTERNAL_ERROR, ErrorCode
 
 import mlflow_mongodb.model_registry.store as registry_store
-from mlflow_mongodb import MongoDBModelRegistryStore
 from mlflow_mongodb.infrastructure.errors import (
     RepositoryAlreadyExistsError,
     RepositoryPersistenceError,
 )
+from mlflow_mongodb.model_registry.store import MongoDBModelRegistryStore
 
 
 def test_create_model_version_handles_failure_after_version_allocation(

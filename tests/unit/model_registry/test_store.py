@@ -14,11 +14,11 @@ from mlflow.protos.databricks_pb2 import (
     ErrorCode,
 )
 
-from mlflow_mongodb import MongoDBModelRegistryStore
 from mlflow_mongodb.infrastructure.errors import (
     RepositoryAlreadyExistsError,
     RepositoryNotFoundError,
 )
+from mlflow_mongodb.model_registry.store import MongoDBModelRegistryStore
 
 MODEL_NAME = "fraud-detector"
 RENAMED_MODEL_NAME = "fraud-detector-v2"
