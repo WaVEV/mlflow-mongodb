@@ -14,11 +14,11 @@ from mlflow_mongodb.infrastructure.errors import (
     RepositoryAlreadyExistsError,
     RepositoryNotActiveError,
     RepositoryNotFoundError,
+    RepositoryParamConflictError,
 )
 from mlflow_mongodb.infrastructure.repository_operations import repository_operation
 from mlflow_mongodb.infrastructure.search_filters import build_value_condition
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
-from mlflow_mongodb.tracking.errors import RepositoryParamConflictError
 from mlflow_mongodb.tracking.types import RunMetricRecord, RunRecord
 
 
@@ -140,14 +140,14 @@ class RunRepository:
             match = {
                 "tags": {
                     "$elemMatch": {
-                        "key": MLFLOW_DATASET_CONTEXT,
-                        "value": build_value_condition(comparator, value),
+                        "k": MLFLOW_DATASET_CONTEXT,
+                        "v": build_value_condition(comparator, value),
                     }
                 }
             }
             if comparator in ("!=", "NOT IN"):
                 match["tags"]["$elemMatch"] = {
-                    "$and": [match["tags"]["$elemMatch"], {"value": {"$ne": None}}]
+                    "$and": [match["tags"]["$elemMatch"], {"v": {"$ne": None}}]
                 }
         else:
             field = f"dataset.{key}"

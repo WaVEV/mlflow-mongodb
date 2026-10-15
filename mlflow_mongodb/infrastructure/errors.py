@@ -74,5 +74,17 @@ class RepositoryInvalidFilterValueError(Exception):
         super().__init__(f"Search filter requires {expected}")
 
 
+class RepositoryParamConflictError(Exception):
+    """Raised when an operation attempts to change an existing parameter value."""
+
+
 class RepositoryTagNotFoundError(Exception):
     """Raised when a requested tag is missing from an existing resource."""
+
+
+class RepositoryWriteConflictError(Exception):
+    """Raised when a concurrent write invalidates the state required for an update."""
+
+
+class RepositoryInvalidPromptFilterError(Exception):
+    """Raised when a linked-prompt filter is not an exact name/version comparison."""

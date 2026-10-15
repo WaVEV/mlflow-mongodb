@@ -1,13 +1,18 @@
 """Skeleton of the MongoDB tracking store for the agreed V1 scope."""
 
+import asyncio
 import binascii
+import json
 import logging
 import math
+from collections import defaultdict
+from copy import deepcopy
 from functools import cached_property
-from typing import Any
+from typing import Any, NoReturn
 from uuid import uuid4
 
 from mlflow.entities import (
+    Assessment,
     Dataset,
     DatasetInput,
     Experiment,
@@ -26,37 +31,75 @@ from mlflow.entities import (
     RunOutputs,
     RunStatus,
     RunTag,
+    Trace,
+    TraceData,
+    TraceInfo,
+    TraceLocation,
+    TraceState,
     ViewType,
 )
+from mlflow.entities.assessment import ExpectationValue, FeedbackValue
 from mlflow.entities.logged_model_parameter import LoggedModelParameter
 from mlflow.entities.logged_model_status import LoggedModelStatus
 from mlflow.entities.logged_model_tag import LoggedModelTag
+from mlflow.entities.model_registry import PromptVersion
+from mlflow.entities.span import Span
+from mlflow.entities.span_status import SpanStatusCode
+from mlflow.entities.trace_metrics import (
+    MetricAggregation,
+    MetricDataPoint,
+    MetricViewType,
+)
 from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import (
     BAD_REQUEST,
+    INTERNAL_ERROR,
     INVALID_PARAMETER_VALUE,
     INVALID_STATE,
     RESOURCE_ALREADY_EXISTS,
     RESOURCE_DOES_NOT_EXIST,
+    TEMPORARILY_UNAVAILABLE,
 )
 from mlflow.store.entities.paged_list import PagedList
 from mlflow.store.tracking import (
+    MAX_RESULTS_QUERY_TRACE_METRICS,
     SEARCH_LOGGED_MODEL_MAX_RESULTS_DEFAULT,
     SEARCH_MAX_RESULTS_DEFAULT,
     SEARCH_MAX_RESULTS_THRESHOLD,
+    SEARCH_TRACES_DEFAULT_MAX_RESULTS,
 )
 from mlflow.store.tracking.abstract_store import AbstractStore
+from mlflow.tracing.constant import (
+    TRACE_REQUEST_RESPONSE_PREVIEW_MAX_LENGTH_OSS,
+    GenAiSemconvKey,
+    SpanAttributeKey,
+    SpansLocation,
+    TraceMetadataKey,
+    TraceSizeStatsKey,
+    TraceTagKey,
+)
+from mlflow.tracing.otel.translation import translate_span_when_storing
+from mlflow.tracing.utils import (
+    SpanAggregationNode,
+    aggregate_cost_from_span_nodes,
+    aggregate_usage_from_span_nodes,
+    generate_assessment_id,
+    try_json_loads,
+)
+from mlflow.tracing.utils.truncation import _get_truncated_preview
 from mlflow.utils.mlflow_tags import MLFLOW_RUN_NAME, _get_run_name_from_tags
 from mlflow.utils.name_utils import _generate_random_name
 from mlflow.utils.search_utils import (
     SearchExperimentsUtils,
     SearchLoggedModelsPaginationToken,
     SearchLoggedModelsUtils,
+    SearchTraceUtils,
     SearchUtils,
 )
 from mlflow.utils.time import get_current_time_millis
 from mlflow.utils.uri import append_to_uri_path, resolve_uri_if_local
 from mlflow.utils.validation import (
+    _resolve_experiment_ids_and_locations,
     _validate_batch_log_data,
     _validate_batch_log_limits,
     _validate_dataset_inputs,
@@ -68,6 +111,7 @@ from mlflow.utils.validation import (
     _validate_metric_name,
     _validate_param_keys_unique,
     _validate_run_id,
+    _validate_trace_tag,
 )
 from pymongo import MongoClient
 from pymongo.database import Database
@@ -78,12 +122,17 @@ from mlflow_mongodb.infrastructure.errors import (
     RepositoryEmptySearchKeyError,
     RepositoryInvalidAttributeError,
     RepositoryInvalidFilterValueError,
+    RepositoryInvalidPromptFilterError,
+    RepositoryInvalidRegexError,
     RepositoryNotActiveError,
     RepositoryNotFoundError,
+    RepositoryParamConflictError,
     RepositoryTagNotFoundError,
     RepositoryUnsupportedComparatorError,
     RepositoryUnsupportedFieldTypeError,
+    RepositoryWriteConflictError,
 )
+from mlflow_mongodb.infrastructure.retry import retry_on_exception
 from mlflow_mongodb.infrastructure.search_filters import (
     ConfiguredSearchFilterValidator,
     SearchFilterClause,
@@ -91,7 +140,6 @@ from mlflow_mongodb.infrastructure.search_filters import (
 )
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 from mlflow_mongodb.infrastructure.store_errors import handle_persistence_error
-from mlflow_mongodb.tracking.errors import RepositoryParamConflictError
 from mlflow_mongodb.tracking.repositories import (
     ExperimentRepository,
     LoggedModelRepository,
@@ -100,9 +148,32 @@ from mlflow_mongodb.tracking.repositories import (
 from mlflow_mongodb.tracking.repositories.experiments import ExperimentFilter, ExperimentOrder
 from mlflow_mongodb.tracking.repositories.logged_models import LoggedModelFilter, LoggedModelOrder
 from mlflow_mongodb.tracking.repositories.runs import RunFilter, RunOrder
-from mlflow_mongodb.tracking.types import LoggedModelRecord, RunMetricRecord, RunRecord
+from mlflow_mongodb.tracking.repositories.traces import (
+    TraceRepository,
+    TraceSearchFilter,
+    TraceSearchOrder,
+)
+from mlflow_mongodb.tracking.types import (
+    LoggedModelRecord,
+    RunMetricRecord,
+    RunRecord,
+    SpanDimensionKey,
+    SpanRecord,
+    SpanSummaryRecord,
+    TraceRecord,
+)
+
+try:
+    from mlflow.utils.search_utils import SearchEvaluationDatasetsUtils
+except ImportError:
+    # MLflow 3.1 has no evaluation-dataset search API or parser.
+    SearchEvaluationDatasetsUtils = None
 
 logger = logging.getLogger(__name__)
+
+
+class _TraceNotFullyExportedError(Exception):
+    """Raised while a trace's expected spans are still being persisted."""
 
 
 class MongoDBTrackingStore(AbstractStore):
@@ -155,6 +226,16 @@ class MongoDBTrackingStore(AbstractStore):
     @handle_persistence_error("Unable to initialize run repository.", logger=logger)
     def _run_repository(self) -> RunRepository:
         return RunRepository(self._database, settings=self._settings)
+
+    @cached_property
+    @handle_persistence_error("Unable to initialize trace repository.", logger=logger)
+    def _trace_repository(self) -> TraceRepository:
+        return TraceRepository(self._database, settings=self._settings)
+
+    @cached_property
+    @handle_persistence_error("Unable to initialize logged model repository.", logger=logger)
+    def _logged_model_repository(self) -> LoggedModelRepository:
+        return LoggedModelRepository(self._database, settings=self._settings)
 
     @handle_persistence_error("A database operation failed.", logger=logger)
     def search_experiments(
@@ -800,7 +881,7 @@ class MongoDBTrackingStore(AbstractStore):
         dataset_inputs = [
             {
                 "dataset": dataset_input.dataset.to_dictionary(),
-                "tags": [{"key": tag.key, "value": tag.value} for tag in dataset_input.tags],
+                "tags": [{"k": tag.key, "v": tag.value} for tag in dataset_input.tags],
             }
             for dataset_input in datasets or []
         ]
@@ -891,10 +972,874 @@ class MongoDBTrackingStore(AbstractStore):
             next_token,
         )
 
+    @handle_persistence_error("Unable to start trace.", logger=logger)
+    def start_trace(self, trace_info: TraceInfo) -> TraceInfo:
+        experiment = self.get_experiment(trace_info.experiment_id)
+
+        if experiment.lifecycle_stage != LifecycleStage.ACTIVE:
+            raise MlflowException(
+                f"The experiment {experiment.experiment_id} must be in the 'active' state. "
+                f"Current state is {experiment.lifecycle_stage}.",
+                INVALID_PARAMETER_VALUE,
+            )
+
+        tags = dict(trace_info.tags)
+        # Span payloads belong in MongoDB, so do not advertise an artifact URI.
+        tags[TraceTagKey.SPANS_LOCATION] = SpansLocation.TRACKING_STORE.value
+        source_run_id = trace_info.trace_metadata.get(TraceMetadataKey.SOURCE_RUN)
+        run_ids = [source_run_id] if source_run_id else []
+        assessments = []
+        for assessment in trace_info.assessments:
+            document = self._assessment_to_document(assessment)
+            if not document.get("assessment_id"):
+                document["assessment_id"] = uuid4().hex
+            if not document.get("trace_id"):
+                document["trace_id"] = trace_info.trace_id
+            assessments.append(document)
+
+        record = self._trace_repository.start_trace(
+            trace_id=trace_info.trace_id,
+            experiment_id=experiment.experiment_id,
+            request_time=trace_info.request_time,
+            state=trace_info.state.value,
+            execution_duration=trace_info.execution_duration,
+            client_request_id=trace_info.client_request_id,
+            request_preview=trace_info.request_preview,
+            response_preview=trace_info.response_preview,
+            tags=tags,
+            trace_metadata=trace_info.trace_metadata,
+            assessments=assessments,
+            run_ids=run_ids,
+            span_stats=(
+                self._parse_span_stats(trace_info.trace_metadata[TraceMetadataKey.SIZE_STATS])
+                if TraceMetadataKey.SIZE_STATS in trace_info.trace_metadata
+                else None
+            ),
+            metrics={
+                field: self._numeric_trace_stats(trace_info.trace_metadata[key])
+                for field, key in (
+                    ("token_usage", TraceMetadataKey.TOKEN_USAGE),
+                    ("cost", TraceMetadataKey.COST),
+                )
+                if key in trace_info.trace_metadata
+            },
+        )
+
+        return self._to_trace_info(record)
+
+    @staticmethod
+    def _parse_span_stats(value: str) -> dict[str, Any]:
+        """Decode MLflow's serialized stats at the store boundary."""
+        if not value:
+            return {}
+        try:
+            stats = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            logger.error("Unable to parse trace size stats: %s", exc)
+            raise MlflowException.invalid_parameter_value(
+                "Invalid trace size-stats JSON."
+            ) from None
+        if not isinstance(stats, dict):
+            raise MlflowException.invalid_parameter_value("Trace size stats must be an object.")
+        count = stats.get(TraceSizeStatsKey.NUM_SPANS, 0)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise MlflowException.invalid_parameter_value(
+                "Trace size-stats num_spans must be a non-negative integer."
+            )
+        return stats
+
+    @staticmethod
+    def _to_trace_info(record: TraceRecord) -> TraceInfo:
+        return TraceInfo(
+            trace_id=record.trace_id,
+            trace_location=TraceLocation.from_experiment_id(record.experiment_id),
+            request_time=record.request_time,
+            state=TraceState(record.state),
+            execution_duration=record.execution_duration,
+            client_request_id=record.client_request_id,
+            request_preview=record.request_preview,
+            response_preview=record.response_preview,
+            tags={tag.key: tag.value for tag in record.tags},
+            trace_metadata={item.key: item.value for item in record.trace_metadata},
+            assessments=[
+                MongoDBTrackingStore._assessment_from_document(item) for item in record.assessments
+            ],
+        )
+
+    @handle_persistence_error("Unable to delete traces.", logger=logger)
+    def delete_traces(
+        self,
+        experiment_id: str,
+        max_timestamp_millis: int | None = None,
+        max_traces: int | None = None,
+        trace_ids: list[str] | None = None,
+    ) -> int:
+        # Keep validation here for compatibility with MLflow versions that do not
+        # implement the public delete_traces wrapper in AbstractStore.
+        if max_timestamp_millis is None and not trace_ids:
+            raise MlflowException.invalid_parameter_value(
+                "Either `max_timestamp_millis` or `trace_ids` must be specified."
+            )
+        if max_timestamp_millis is not None and trace_ids:
+            raise MlflowException.invalid_parameter_value(
+                "Only one of `max_timestamp_millis` and `trace_ids` can be specified."
+            )
+        if trace_ids and max_traces is not None:
+            raise MlflowException.invalid_parameter_value(
+                "`max_traces` can't be specified if `trace_ids` is specified."
+            )
+        if max_traces is not None and max_traces <= 0:
+            raise MlflowException.invalid_parameter_value(
+                f"`max_traces` must be a positive integer, received {max_traces}."
+            )
+
+        return self._trace_repository.delete_traces(
+            experiment_id=experiment_id,
+            max_timestamp_millis=max_timestamp_millis,
+            max_traces=max_traces,
+            trace_ids=trace_ids,
+        )
+
+    @handle_persistence_error("Unable to read trace metadata.", logger=logger)
+    def get_trace_info(self, trace_id: str) -> TraceInfo:
+        return self._to_trace_info(self._get_trace_record(trace_id))
+
+    @handle_persistence_error("Unable to read traces.", logger=logger)
+    def batch_get_traces(
+        self,
+        trace_ids: list[str],
+        location: str | None = None,  # ruff: ignore[unused-method-argument]
+        experiment_ids: list[str] | None = None,
+    ) -> list[Trace]:
+        """Return complete traces in request order, omitting missing or incomplete traces.
+
+        The connection selects MongoDB; location is unused by this backend.
+        """
+        if not trace_ids or experiment_ids == []:
+            return []
+
+        records = self._trace_repository.batch_get_traces(trace_ids, experiment_ids=experiment_ids)
+
+        traces = []
+        for record, span_records in records:
+            if not span_records:
+                continue
+            if record.span_stats and len(span_records) < record.span_stats.get(
+                TraceSizeStatsKey.NUM_SPANS, 0
+            ):
+                continue
+            traces.append(self._to_trace(record, span_records))
+        return traces
+
+    @handle_persistence_error("Unable to read trace metadata.", logger=logger)
+    def batch_get_trace_infos(
+        self,
+        trace_ids: list[str],
+        location: str | None = None,  # ruff: ignore[unused-method-argument]
+        experiment_ids: list[str] | None = None,
+    ) -> list[TraceInfo]:
+        """Return scoped trace metadata in request order without loading spans.
+
+        The connection selects MongoDB; location is unused by this backend.
+        """
+        if not trace_ids or experiment_ids == []:
+            return []
+
+        records = self._trace_repository.batch_get_trace_infos(
+            trace_ids, experiment_ids=experiment_ids
+        )
+
+        return [self._to_trace_info(record) for record in records]
+
+    def _get_trace_record(self, trace_id: str) -> TraceRecord:
+        try:
+            record = self._trace_repository.get_trace_info(trace_id)
+        except RepositoryNotFoundError as exc:
+            logger.error("Unable to read trace metadata: %s", exc)
+            raise MlflowException(
+                f"Trace with ID '{trace_id}' not found.", RESOURCE_DOES_NOT_EXIST
+            ) from None
+
+        return record
+
+    @handle_persistence_error("Unable to read trace.", logger=logger)
+    def get_trace(self, trace_id: str, *, allow_partial: bool = False) -> Trace:
+        """Load persisted spans, retrying incomplete exports unless partial reads are allowed."""
+        try:
+            return self._get_trace(trace_id, allow_partial=allow_partial)
+        except _TraceNotFullyExportedError as exc:
+            logger.error("Unable to read complete trace: %s", exc)
+            raise MlflowException(
+                f"Trace with ID {trace_id} is not fully exported yet, please try again later.",
+                RESOURCE_DOES_NOT_EXIST,
+            ) from None
+
+    @retry_on_exception(_TraceNotFullyExportedError, attempts=3, backoff_seconds=(1, 2))
+    def _get_trace(self, trace_id: str, *, allow_partial: bool) -> Trace:
+        # Refresh metadata and spans on each attempt because they arrive separately.
+        # Missing metadata and database errors propagate immediately without retrying.
+        record = self._get_trace_record(trace_id)
+
+        span_documents = self._trace_repository.get_spans(trace_id)
+
+        if not allow_partial:
+            if trace_stats := record.span_stats:
+                expected_spans = trace_stats.get(TraceSizeStatsKey.NUM_SPANS, 0)
+                if len(span_documents) < expected_spans:
+                    raise _TraceNotFullyExportedError
+            # Without stats, a nonempty result has no further completeness check.
+            if not span_documents:
+                raise _TraceNotFullyExportedError
+
+        return self._to_trace(record, span_documents)
+
+    def _to_trace(self, record: TraceRecord, span_records: list[SpanRecord]) -> Trace:
+        trace_info = self._to_trace_info(record)
+        spans = [Span.from_dict(span_record.content) for span_record in span_records]
+        spans.sort(key=lambda span: (span.parent_id is not None, span.start_time_ns, span.span_id))
+        return Trace(info=trace_info, data=TraceData(spans=spans))
+
+    @handle_persistence_error("Unable to log spans.", logger=logger)
+    def log_spans(
+        self,
+        location: str,
+        spans: list[Span],
+        tracking_uri: str | None = None,  # ruff: ignore[unused-method-argument]
+    ) -> list[Span]:
+        """Persist spans and refresh their traces, allowing repeated and late delivery.
+
+        The store's connection selects MongoDB; tracking_uri is unused by this backend.
+        Writes across collections are separate and may partially succeed on failure.
+        """
+        if not spans:
+            return []
+        if not isinstance(location, str) or not location:
+            raise MlflowException.invalid_parameter_value("location must be an experiment ID.")
+
+        self._validate_span_ingestion_experiment(location)
+        documents, documents_by_trace = self._prepare_span_documents(spans)
+        self._ensure_span_traces(location, documents_by_trace)
+        self._persist_span_documents(documents)
+        self._refresh_span_summaries(location, documents_by_trace)
+        return spans
+
+    def _validate_span_ingestion_experiment(self, experiment_id: str) -> None:
+        experiment = self.get_experiment(experiment_id)
+
+        if experiment.lifecycle_stage != LifecycleStage.ACTIVE:
+            raise MlflowException.invalid_parameter_value(
+                f"The experiment {experiment_id} must be in the 'active' state. "
+                f"Current state is {experiment.lifecycle_stage}."
+            )
+
+    def _ensure_span_traces(
+        self,
+        experiment_id: str,
+        documents_by_trace: defaultdict[str, list[dict[str, Any]]],
+    ) -> None:
+        request_times = {
+            trace_id: min(document["start_time_ns"] for document in trace_documents) // 1_000_000
+            for trace_id, trace_documents in documents_by_trace.items()
+        }
+        self._trace_repository.ensure_traces(
+            experiment_id=experiment_id, request_times=request_times
+        )
+
+    def _persist_span_documents(self, documents: list[dict[str, Any]]) -> None:
+        self._trace_repository.log_spans(documents)
+
+    def _refresh_span_summaries(
+        self,
+        experiment_id: str,
+        documents_by_trace: defaultdict[str, list[dict[str, Any]]],
+    ) -> None:
+        try:
+            for trace_id in documents_by_trace:
+                self._refresh_trace_span_summary(trace_id, experiment_id)
+        except RepositoryNotFoundError as exc:
+            logger.error("Unable to refresh trace span summaries: %s", exc)
+            raise MlflowException(
+                f"Trace '{exc.args[0]}' was deleted during span ingestion.",
+                RESOURCE_DOES_NOT_EXIST,
+            ) from None
+        except RepositoryWriteConflictError as exc:
+            logger.error("Unable to refresh trace span summaries: %s", exc)
+            raise MlflowException(
+                f"Concurrent span writes prevented refreshing trace '{exc.args[0]}'. "
+                "Retry log_spans to refresh its summary; stored spans are deduplicated.",
+                TEMPORARILY_UNAVAILABLE,
+            ) from None
+
+    @staticmethod
+    def _span_attribute_value(value: Any) -> Any:
+        # Span.to_dict() retains MLflow's JSON-encoded OTel attribute values.
+        # Decode only the fields used for queries; preserve content for Span.from_dict().
+        return try_json_loads(value) if isinstance(value, str) else value
+
+    @classmethod
+    def _numeric_trace_stats(cls, value: Any) -> dict | None:
+        """Read optional numeric usage/cost attributes without failing span ingestion."""
+        value = cls._span_attribute_value(value)
+        if not isinstance(value, dict):
+            return None
+        if any(
+            isinstance(number, bool)
+            or not isinstance(number, (int, float))
+            or (isinstance(number, float) and not math.isfinite(number))
+            for number in value.values()
+        ):
+            return None
+        return value
+
+    @staticmethod
+    def _add_span_trace_tag(tags: dict[str, str], key: str, value: Any) -> None:
+        try:
+            value = value if isinstance(value, str) else json.dumps(value)
+            key, value = _validate_trace_tag(key, value)
+        except (MlflowException, TypeError, ValueError):
+            logger.debug("Skipping invalid span-derived trace tag %r", key)
+            return
+        tags[key] = value
+
+    @staticmethod
+    def _span_preview(value: Any, role: str) -> str | None:
+        try:
+            if value is not None and not isinstance(value, (str, dict)):
+                value = json.dumps(value)
+            preview = _get_truncated_preview(value, role=role)
+            # MLflow's helper consults the process-global URI for its size limit.
+            # A direct MongoDB store always uses the OSS limit, even in mixed clients.
+            if preview is not None and len(preview) > TRACE_REQUEST_RESPONSE_PREVIEW_MAX_LENGTH_OSS:
+                return preview[: TRACE_REQUEST_RESPONSE_PREVIEW_MAX_LENGTH_OSS - 3] + "..."
+            return preview
+        except (TypeError, ValueError, AttributeError) as exc:
+            logger.debug("Could not extract the %s trace preview: %s", role, exc)
+            return None
+
+    @classmethod
+    def _span_to_document(cls, span: Span) -> dict[str, Any]:
+        """Keep full span content plus compact native fields for summary queries."""
+
+        content = translate_span_when_storing(span)
+        attributes = content.get("attributes", {})
+        root = span.parent_id is None
+        resource_tags = {}
+        resource = getattr(span._span, "resource", None)
+        if resource is not None:
+            for key, value in resource.attributes.items():
+                if not key.startswith(("telemetry.sdk.", "mlflow.")):
+                    cls._add_span_trace_tag(resource_tags, key, value)
+        root_tags = {}
+        if root:
+            for key, value in attributes.items():
+                if key.startswith(SpanAttributeKey.TRACE_TAG_PREFIX):
+                    tag_key = key[len(SpanAttributeKey.TRACE_TAG_PREFIX) :]
+                    if tag_key != TraceTagKey.SPANS_LOCATION:
+                        cls._add_span_trace_tag(
+                            root_tags, tag_key, cls._span_attribute_value(value)
+                        )
+
+        metadata = {}
+        session_id = attributes.get(SpanAttributeKey.SESSION_ID) or attributes.get(
+            GenAiSemconvKey.CONVERSATION_ID
+        )
+        for key, value in (
+            (TraceMetadataKey.TRACE_SESSION, session_id),
+            (TraceMetadataKey.TRACE_USER, attributes.get(SpanAttributeKey.USER_ID)),
+        ):
+            if value is not None:
+                metadata[key] = str(cls._span_attribute_value(value))
+
+        return {
+            "trace_id": span.trace_id,
+            "span_id": span.span_id,
+            "parent_span_id": span.parent_id,
+            "name": span.name,
+            "type": cls._span_attribute_value(attributes.get(SpanAttributeKey.SPAN_TYPE))
+            or span.span_type,
+            "status": span.status.status_code.value,
+            "start_time_ns": span.start_time_ns,
+            "end_time_ns": span.end_time_ns,
+            "content": content,
+            "dimension_attributes": {
+                field: cls._span_attribute_value(attributes[attribute])
+                for field, attribute in (
+                    (SpanDimensionKey.MODEL, SpanAttributeKey.MODEL),
+                    (SpanDimensionKey.MODEL_PROVIDER, SpanAttributeKey.MODEL_PROVIDER),
+                )
+                if attribute in attributes
+            },
+            "token_usage": cls._numeric_trace_stats(attributes.get(SpanAttributeKey.CHAT_USAGE)),
+            "cost": cls._numeric_trace_stats(attributes.get(SpanAttributeKey.LLM_COST)),
+            "trace_fields": {
+                "metadata": metadata,
+                "resource_tags": resource_tags,
+                "root_tags": root_tags,
+                "request_preview": cls._span_preview(
+                    attributes.get(SpanAttributeKey.INPUTS), "user"
+                )
+                if root
+                else None,
+                "response_preview": cls._span_preview(
+                    attributes.get(SpanAttributeKey.OUTPUTS), "assistant"
+                )
+                if root
+                else None,
+            },
+        }
+
+    @staticmethod
+    def _summarize_spans(documents: list[SpanSummaryRecord]) -> dict[str, Any]:
+        """Recompute from unique persisted spans, including parents arriving in later batches."""
+
+        start_ms = min(document.start_time_ns for document in documents) // 1_000_000
+        end_times = [d.end_time_ns for d in documents if d.end_time_ns is not None]
+        root = next((d for d in documents if d.parent_span_id is None), None)
+        metadata = {}
+        tags = {}
+        for document in documents:
+            for key, value in document.trace_fields["metadata"].items():
+                metadata.setdefault(key, value)
+            for key, value in document.trace_fields["resource_tags"].items():
+                tags.setdefault(key, value)
+        if root:
+            tags.update(root.trace_fields["root_tags"])
+
+        if not root:
+            state = TraceState.IN_PROGRESS.value
+        elif root.status == SpanStatusCode.ERROR.value:
+            state = TraceState.ERROR.value
+        else:
+            state = TraceState.OK.value
+
+        return {
+            "request_time": start_ms,
+            "execution_duration": max(end_times) // 1_000_000 - start_ms if end_times else None,
+            "state": state,
+            "request_preview": root.trace_fields["request_preview"] if root else None,
+            "response_preview": root.trace_fields["response_preview"] if root else None,
+            "tags": tags,
+            "metadata": metadata,
+            "token_usage": aggregate_usage_from_span_nodes(
+                [SpanAggregationNode(d.span_id, d.parent_span_id, d.token_usage) for d in documents]
+            ),
+            "cost": aggregate_cost_from_span_nodes(
+                [SpanAggregationNode(d.span_id, d.parent_span_id, d.cost) for d in documents]
+            ),
+        }
+
+    @classmethod
+    def _prepare_span_documents(
+        cls,
+        spans: list[Span],
+    ) -> tuple[list[dict[str, Any]], defaultdict[str, list[dict[str, Any]]]]:
+        # First delivery wins, including repeated identities in the same batch.
+        # Prepare documents before creating placeholders; the driver validates BSON on write.
+        documents_by_identity = {}
+        for span in spans:
+            identity = (span.trace_id, span.span_id)
+            if identity not in documents_by_identity:
+                documents_by_identity[identity] = cls._span_to_document(span)
+
+        documents_by_trace = defaultdict(list)
+        for document in documents_by_identity.values():
+            documents_by_trace[document["trace_id"]].append(document)
+        return list(documents_by_identity.values()), documents_by_trace
+
+    @retry_on_exception(RepositoryWriteConflictError, attempts=3, backoff_seconds=(0.01, 0.05))
+    def _refresh_trace_span_summary(self, trace_id: str, experiment_id: str) -> None:
+        revision, documents = self._trace_repository.span_summary_snapshot(
+            trace_id=trace_id, experiment_id=experiment_id
+        )
+        if not documents:
+            # Span deletion precedes trace deletion; do not finalize an empty
+            # snapshot or invent a successful write while deletion is in progress.
+            raise RepositoryNotFoundError(trace_id)
+        summary = self._summarize_spans(documents)
+        # MLflow's trace_metadata contract requires strings. The corresponding
+        # native fields are stored in the same atomic update for MongoDB queries.
+        summary["aggregate_metadata"] = {
+            key: json.dumps(summary[field])
+            for field, key in (
+                ("token_usage", TraceMetadataKey.TOKEN_USAGE),
+                ("cost", TraceMetadataKey.COST),
+            )
+            if summary[field] is not None
+        }
+        self._trace_repository.update_span_summary(
+            trace_id=trace_id, experiment_id=experiment_id, revision=revision, summary=summary
+        )
+
+    async def log_spans_async(self, location: str, spans: list[Span]) -> list[Span]:
+        return await asyncio.to_thread(self.log_spans, location, spans)
+
+    @handle_persistence_error("Unable to set trace tag.", logger=logger)
+    def set_trace_tag(self, trace_id: str, key: str, value: str) -> None:
+        key, value = _validate_trace_tag(key, value)
+        try:
+            self._trace_repository.set_trace_tag(trace_id=trace_id, key=key, value=value)
+        except RepositoryNotFoundError as exc:
+            logger.error("Unable to set trace tag: %s", exc)
+            raise MlflowException(
+                f"Trace with ID '{trace_id}' not found.", RESOURCE_DOES_NOT_EXIST
+            ) from None
+
+    @handle_persistence_error("Unable to delete trace tag.", logger=logger)
+    def delete_trace_tag(self, trace_id: str, key: str) -> None:
+        try:
+            self._trace_repository.delete_trace_tag(trace_id=trace_id, key=key)
+        except RepositoryNotFoundError as exc:
+            logger.error("Unable to delete trace tag: %s", exc)
+            raise MlflowException(
+                f"Trace '{trace_id}' or tag '{key}' not found.",
+                RESOURCE_DOES_NOT_EXIST,
+            ) from None
+
+    @staticmethod
+    def _validate_linked_prompt_filter(clause: SearchFilterClause) -> None:
+        if (
+            clause.field_type == "tag"
+            and clause.key == TraceTagKey.LINKED_PROMPTS
+            and (clause.comparator != "=" or clause.value.count("/") != 1)
+        ):
+            raise RepositoryInvalidPromptFilterError("Invalid linked-prompt comparison.")
+
+    @staticmethod
+    def _validate_reserved_metadata_filter(clause: SearchFilterClause) -> None:
+        allowed = ("=", "!=", "IS NULL", "IS NOT NULL")
+        if (
+            clause.field_type == "request_metadata"
+            and clause.key in (TraceMetadataKey.TOKEN_USAGE, TraceMetadataKey.COST)
+            and clause.comparator not in allowed
+        ):
+            raise RepositoryUnsupportedComparatorError(
+                clause.field_type, clause.key, clause.comparator, allowed, field_specific=True
+            )
+
     @cached_property
-    @handle_persistence_error("Unable to initialize logged model repository.", logger=logger)
-    def _logged_model_repository(self) -> LoggedModelRepository:
-        return LoggedModelRepository(self._database, settings=self._settings)
+    def _trace_filter_validator(self) -> SearchFilterValidator:
+        return ConfiguredSearchFilterValidator(
+            rules=(self._validate_linked_prompt_filter, self._validate_reserved_metadata_filter),
+            field_types=("attribute", "tag", "request_metadata"),
+            # MLflow resolves aliases before validation (name/prompt/run_id become tags/metadata).
+            attribute_keys=SearchTraceUtils.VALID_SEARCH_ATTRIBUTE_KEYS,
+            comparators={
+                "attribute": SearchTraceUtils.VALID_STRING_ATTRIBUTE_COMPARATORS,
+                "tag": SearchTraceUtils.VALID_TAG_COMPARATORS,
+                "request_metadata": SearchTraceUtils.VALID_METADATA_COMPARATORS,
+            },
+            field_comparators={
+                ("attribute", key): SearchTraceUtils.VALID_NUMERIC_ATTRIBUTE_COMPARATORS
+                for key in SearchTraceUtils.NUMERIC_ATTRIBUTES
+            },
+            regex_comparators=("RLIKE",),
+        )
+
+    def _parse_trace_filters(self, filter_string: str | None) -> list[TraceSearchFilter]:
+        filters = []
+        for parsed in SearchTraceUtils.parse_search_filter_for_search_traces(filter_string):
+            # TODO: Apply span and assessment filters before pagination, preserving same-span
+            # matching, direct/session-scoped assessments, and unique trace results.
+            if parsed["type"] in ("span", "feedback", "expectation", "issue"):
+                continue
+            try:
+                clause = self._trace_filter_validator.validate(parsed)
+            except RepositoryUnsupportedFieldTypeError as exc:
+                logger.error("Unable to validate trace filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid trace search field type: {exc.field_type}"
+                ) from None
+            except RepositoryInvalidAttributeError as exc:
+                logger.error("Unable to validate trace filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid trace search attribute: {exc.key}"
+                ) from None
+            except RepositoryUnsupportedComparatorError as exc:
+                logger.error("Unable to validate trace filter: %s", exc)
+                if exc.field_specific and exc.field_type == "request_metadata":
+                    message = (
+                        f"Comparator '{exc.comparator}' is not supported for reserved metadata "
+                        f"'{exc.key}'. Only '=', '!=', 'IS NULL', and 'IS NOT NULL' are supported."
+                    )
+                else:
+                    message = (
+                        f"Invalid comparator '{exc.comparator}' for trace {exc.field_type} "
+                        f"'{exc.key}'. Supported comparators: {exc.allowed}."
+                    )
+                raise MlflowException.invalid_parameter_value(message) from None
+            except RepositoryInvalidPromptFilterError as exc:
+                logger.error("Unable to validate trace prompt filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    'Prompt filters require `prompt = "name/version"`.'
+                ) from None
+            except RepositoryInvalidRegexError as exc:
+                logger.error("Unable to parse trace filter regular expression: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    "Invalid regular expression in trace filter."
+                ) from None
+            filters.append(
+                TraceSearchFilter(clause.field_type, clause.key, clause.comparator, clause.value)
+            )
+        return filters
+
+    @handle_persistence_error("Unable to search traces.", logger=logger)
+    def search_traces(
+        self,
+        experiment_ids: list[str] | None = None,
+        filter_string: str | None = None,
+        max_results: int = SEARCH_TRACES_DEFAULT_MAX_RESULTS,
+        order_by: list[str] | None = None,
+        page_token: str | None = None,
+        model_id: str | None = None,  # ruff: ignore[unused-method-argument]
+        locations: list[str] | None = None,
+    ) -> tuple[list[TraceInfo], str | None]:
+        locations = _resolve_experiment_ids_and_locations(experiment_ids, locations)
+        if (
+            isinstance(max_results, bool)
+            or not isinstance(max_results, int)
+            or max_results < 1
+            or max_results > SEARCH_MAX_RESULTS_THRESHOLD
+        ):
+            raise MlflowException(
+                f"Invalid value {max_results} for parameter 'max_results' supplied. It must be "
+                f"a positive integer at most {SEARCH_MAX_RESULTS_THRESHOLD}",
+                INVALID_PARAMETER_VALUE,
+            )
+        filters = self._parse_trace_filters(filter_string)
+
+        orders = []
+        seen_order_fields = set()
+        for clause in order_by or []:
+            field_type, key, ascending = SearchTraceUtils.parse_order_by_for_search_traces(clause)
+            if field_type == "attribute":
+                SearchTraceUtils.is_attribute(field_type, key, "=")
+            elif field_type == "tag":
+                SearchTraceUtils.is_tag(field_type, "=")
+            elif field_type == "request_metadata":
+                SearchTraceUtils.is_request_metadata(field_type, "=")
+            else:
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid trace ordering field: {field_type}"
+                )
+            if field_type == "request_metadata" and key in (
+                TraceMetadataKey.TOKEN_USAGE,
+                TraceMetadataKey.COST,
+            ):
+                raise MlflowException.invalid_parameter_value(
+                    f"Ordering by reserved metadata '{key}' is not supported."
+                )
+            if (field_type, key) in seen_order_fields:
+                raise MlflowException.invalid_parameter_value(
+                    f"`order_by` contains duplicate fields: {order_by}"
+                )
+            seen_order_fields.add((field_type, key))
+            orders.append(TraceSearchOrder(field_type, key, ascending))
+        offset = SearchTraceUtils.parse_start_offset_from_page_token(page_token)
+        if offset < 0:
+            raise MlflowException("Page offset must not be negative.", INVALID_PARAMETER_VALUE)
+        records = self._trace_repository.search_trace_infos(
+            experiment_ids=locations,
+            filters=filters,
+            order_by=orders,
+            offset=offset,
+            limit=max_results,
+        )
+
+        next_token = None
+        if len(records) == max_results:
+            next_token = SearchTraceUtils.create_page_token(offset + max_results)
+        return [self._to_trace_info(record) for record in records], next_token
+
+    @staticmethod
+    def _assessment_to_document(assessment: Assessment) -> dict[str, Any]:
+        document = assessment.to_dictionary()
+        if assessment.expectation is not None:
+            document["expectation"] = {"value": deepcopy(assessment.expectation.value)}
+        elif assessment.feedback is not None:
+            document["feedback"]["value"] = deepcopy(assessment.feedback.value)
+        if assessment.run_id is not None:
+            document["run_id"] = assessment.run_id
+        return document
+
+    @staticmethod
+    def _assessment_from_document(document: dict[str, Any]) -> Assessment:
+        assessment = Assessment.from_dictionary(document)
+        assessment.valid = document.get("valid", True)
+        assessment.overrides = document.get("overrides")
+        assessment.run_id = document.get("run_id", assessment.run_id)
+        return assessment
+
+    def _raise_assessment_not_found(
+        self, trace_id: str, assessment_id: str, exc: RepositoryNotFoundError
+    ) -> NoReturn:
+        # Match MLflow's distinction between a missing trace and a missing assessment.
+        self._get_trace_record(trace_id)
+        logger.error("Unable to find assessment: %s", exc)
+        raise MlflowException(
+            f"Assessment with ID '{assessment_id}' not found for trace '{trace_id}'",
+            RESOURCE_DOES_NOT_EXIST,
+        ) from None
+
+    @handle_persistence_error("Unable to read assessment.", logger=logger)
+    def get_assessment(self, trace_id: str, assessment_id: str) -> Assessment:
+        try:
+            document = self._trace_repository.get_assessment(
+                trace_id=trace_id, assessment_id=assessment_id
+            )
+        except RepositoryNotFoundError as exc:
+            self._raise_assessment_not_found(trace_id, assessment_id, exc)
+        return self._assessment_from_document(document)
+
+    @handle_persistence_error("Unable to create assessment.", logger=logger)
+    def create_assessment(self, assessment: Assessment) -> Assessment:
+        trace = self._get_trace_record(assessment.trace_id)
+        if assessment.overrides:
+            self.get_assessment(assessment.trace_id, assessment.overrides)
+        if assessment.assessment_id is None:
+            assessment.assessment_id = generate_assessment_id()
+        created = deepcopy(assessment)
+        created.valid = True
+        now = get_current_time_millis()
+        created.create_time_ms = created.create_time_ms or now
+        created.last_update_time_ms = created.last_update_time_ms or now
+        document = self._assessment_to_document(created)
+        try:
+            document = self._trace_repository.create_assessment(
+                trace_id=trace.trace_id,
+                experiment_id=trace.experiment_id,
+                content=document,
+            )
+        except RepositoryAlreadyExistsError as exc:
+            logger.error("Unable to create assessment: %s", exc)
+            raise MlflowException(
+                "Unable to create assessment due to an identity conflict.", INTERNAL_ERROR
+            ) from None
+        except RepositoryNotFoundError as exc:
+            self._raise_assessment_not_found(trace.trace_id, created.overrides, exc)
+        return self._assessment_from_document(document)
+
+    @handle_persistence_error("Unable to update assessment.", logger=logger)
+    def update_assessment(
+        self,
+        trace_id: str,
+        assessment_id: str,
+        name: str | None = None,
+        expectation: ExpectationValue | None = None,
+        feedback: FeedbackValue | None = None,
+        rationale: str | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> Assessment:
+        existing = self.get_assessment(trace_id, assessment_id)
+        if expectation is not None and feedback is not None:
+            raise MlflowException.invalid_parameter_value(
+                "Cannot specify both `expectation` and `feedback` parameters."
+            )
+        if expectation is not None and existing.expectation is None:
+            raise MlflowException.invalid_parameter_value(
+                "Cannot update expectation value on a Feedback assessment."
+            )
+        if feedback is not None and existing.feedback is None:
+            raise MlflowException.invalid_parameter_value(
+                "Cannot update feedback value on an Expectation assessment."
+            )
+        if expectation is not None and not isinstance(expectation, ExpectationValue):
+            raise MlflowException.invalid_parameter_value(
+                "expectation must be an ExpectationValue."
+            )
+        if feedback is not None and not isinstance(feedback, FeedbackValue):
+            raise MlflowException.invalid_parameter_value("feedback must be a FeedbackValue.")
+        updated = deepcopy(existing)
+        updated.last_update_time_ms = get_current_time_millis()
+        if name is not None:
+            updated.name = name
+        if expectation is not None:
+            updated.expectation = expectation
+        if feedback is not None:
+            updated.feedback = feedback
+            updated.error = feedback.error
+        if rationale is not None:
+            updated.rationale = rationale
+        if metadata is not None:
+            updated.metadata = {**(existing.metadata or {}), **metadata}
+        document = self._assessment_to_document(updated)
+        updates = {"last_update_time": document["last_update_time"]}
+        for key, value in (
+            ("expectation", expectation),
+            ("feedback", feedback),
+        ):
+            if value is not None:
+                updates[key] = document[key]
+        if name is not None:
+            updates["assessment_name"] = name
+        if rationale is not None:
+            updates["rationale"] = rationale
+        if metadata is not None:
+            updates["metadata"] = metadata
+        try:
+            document = self._trace_repository.update_assessment(
+                trace_id=trace_id, assessment_id=assessment_id, updates=updates
+            )
+        except RepositoryNotFoundError as exc:
+            self._raise_assessment_not_found(trace_id, assessment_id, exc)
+        return self._assessment_from_document(document)
+
+    @handle_persistence_error("Unable to delete assessment.", logger=logger)
+    def delete_assessment(self, trace_id: str, assessment_id: str) -> None:
+        self._get_trace_record(trace_id)
+        self._trace_repository.delete_assessment(trace_id=trace_id, assessment_id=assessment_id)
+
+    @handle_persistence_error("Unable to query trace metrics.", logger=logger)
+    def query_trace_metrics(
+        self,
+        experiment_ids: list[str],
+        view_type: MetricViewType,
+        metric_name: str,
+        aggregations: list[MetricAggregation],
+        dimensions: list[str] | None = None,
+        filters: list[str] | None = None,
+        time_interval_seconds: int | None = None,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        max_results: int = MAX_RESULTS_QUERY_TRACE_METRICS,
+        page_token: str | None = None,  # ruff: ignore[unused-method-argument]
+    ) -> PagedList[MetricDataPoint]:
+        # Its SQL models import MLflow clients, which are unavailable during discovery.
+        from mlflow.store.tracking.utils.sql_trace_metrics_utils import (  # ruff: ignore[import-outside-top-level]
+            validate_query_trace_metrics_params,
+        )
+
+        validate_query_trace_metrics_params(view_type, metric_name, aggregations, dimensions)
+        if time_interval_seconds and (start_time_ms is None or end_time_ms is None):
+            raise MlflowException.invalid_parameter_value(
+                "start_time_ms and end_time_ms are required if time_interval_seconds is set"
+            )
+
+        try:
+            points = self._trace_repository.query_trace_metrics(
+                experiment_ids=experiment_ids,
+                view_type=view_type,
+                metric_name=metric_name,
+                aggregations=aggregations,
+                dimensions=dimensions,
+                filters=filters,
+                time_interval_seconds=time_interval_seconds,
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+                max_results=max_results,
+            )
+        except RepositoryUnsupportedFieldTypeError as exc:
+            logger.error("Unable to validate trace metric filter: %s", exc)
+            required_view = {
+                "span": MetricViewType.SPANS,
+                "assessment": MetricViewType.ASSESSMENTS,
+            }[exc.field_type]
+            raise MlflowException.invalid_parameter_value(
+                f"Filtering by {exc.field_type} is only supported for {required_view} view "
+                f"type, got {view_type}"
+            ) from None
+        return PagedList(points, None)
+
+    # Logged models
 
     @handle_persistence_error("Unable to create logged model.", logger=logger)
     def create_logged_model(
@@ -1294,6 +2239,83 @@ class MongoDBTrackingStore(AbstractStore):
             next_token,
         )
 
+    @cached_property
+    def _dataset_filter_validator(self) -> SearchFilterValidator:
+        return ConfiguredSearchFilterValidator(
+            field_types=("attribute", "tag"),
+            attribute_keys=SearchEvaluationDatasetsUtils.VALID_SEARCH_ATTRIBUTE_KEYS,
+            comparators={
+                "attribute": SearchEvaluationDatasetsUtils.VALID_TAG_COMPARATORS,
+                "tag": SearchEvaluationDatasetsUtils.VALID_TAG_COMPARATORS,
+            },
+            field_comparators={
+                (
+                    "attribute",
+                    key,
+                ): SearchEvaluationDatasetsUtils.VALID_NUMERIC_ATTRIBUTE_COMPARATORS
+                for key in SearchEvaluationDatasetsUtils.NUMERIC_ATTRIBUTES
+            },
+            uppercase_comparators=False,
+        )
+
+    def search_datasets(
+        self,
+        experiment_ids: list[str] | None = None,  # ruff: ignore[unused-method-argument]
+        filter_string: str | None = None,
+        max_results: int = 1000,
+        order_by: list[str] | None = None,
+        page_token: str | None = None,
+    ) -> PagedList:
+        """Return an empty evaluation-dataset page until dataset storage is implemented."""
+        if SearchEvaluationDatasetsUtils is None:
+            raise MlflowException.invalid_parameter_value(
+                "Evaluation dataset search is unavailable in this MLflow version."
+            )
+
+        if (
+            isinstance(max_results, bool)
+            or not isinstance(max_results, int)
+            or max_results < 1
+            or max_results > SEARCH_MAX_RESULTS_THRESHOLD
+        ):
+            raise MlflowException.invalid_parameter_value(
+                f"`max_results` must be a positive integer at most {SEARCH_MAX_RESULTS_THRESHOLD}."
+            )
+
+        for parsed in SearchEvaluationDatasetsUtils.parse_search_filter(filter_string):
+            try:
+                self._dataset_filter_validator.validate(parsed)
+            except RepositoryUnsupportedFieldTypeError as exc:
+                logger.error("Unable to validate evaluation dataset filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid evaluation dataset search field type: {exc.field_type}"
+                ) from None
+            except RepositoryInvalidAttributeError as exc:
+                logger.error("Unable to validate evaluation dataset filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid evaluation dataset attribute: {exc.key}"
+                ) from None
+            except RepositoryUnsupportedComparatorError as exc:
+                logger.error("Unable to validate evaluation dataset filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid comparator for evaluation dataset {exc.field_type}: {exc.comparator}"
+                ) from None
+
+        for clause in order_by or []:
+            key_type, _, _ = (
+                SearchEvaluationDatasetsUtils.parse_order_by_for_search_evaluation_datasets(clause)
+            )
+            if key_type != "attribute":
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid order_by entity: {key_type}"
+                )
+        offset = SearchUtils.parse_start_offset_from_page_token(page_token)
+        if offset < 0:
+            raise MlflowException.invalid_parameter_value("Page offset must not be negative.")
+
+        # No evaluation-dataset records can be created by this store yet.
+        return PagedList([], None)
+
     @handle_persistence_error("Unable to get logged model.", logger=logger)
     def get_logged_model(self, model_id: str, allow_deleted: bool = False) -> LoggedModel:
         """Fetch model metadata and its complete associated metric history."""
@@ -1354,3 +2376,39 @@ class MongoDBTrackingStore(AbstractStore):
                 f"No tag with key {key!r} found for model with ID {model_id!r}.",
                 RESOURCE_DOES_NOT_EXIST,
             ) from None
+
+    @handle_persistence_error("Unable to link prompts to trace.", logger=logger)
+    def link_prompts_to_trace(self, trace_id: str, prompt_versions: list[PromptVersion]) -> None:
+        """Associate prompt versions with a trace by their public name/version identity."""
+        if not prompt_versions:
+            return
+
+        refs = [
+            {"name": prompt_version.name, "version": str(prompt_version.version)}
+            for prompt_version in prompt_versions
+        ]
+        try:
+            self._trace_repository.link_prompts(trace_id=trace_id, prompt_versions=refs)
+        except RepositoryNotFoundError as exc:
+            logger.error("Unable to link prompts to trace: %s", exc)
+            raise MlflowException(
+                f"Trace with ID '{trace_id}' not found.", RESOURCE_DOES_NOT_EXIST
+            ) from None
+
+    @handle_persistence_error("Unable to link traces to run.", logger=logger)
+    def link_traces_to_run(self, trace_ids: list[str], run_id: str) -> None:
+        """Add an idempotent run association to at most 100 traces per request."""
+        if not trace_ids:
+            return
+        if not run_id:
+            raise MlflowException.invalid_parameter_value("run_id cannot be empty")
+        if len(trace_ids) > 100:
+            raise MlflowException.invalid_parameter_value(
+                "Cannot link more than 100 traces to a run in a single request. "
+                f"Provided {len(trace_ids)} traces."
+            )
+
+        self._trace_repository.link_traces_to_run(trace_ids=trace_ids, run_id=run_id)
+
+    def unlink_traces_from_run(self, trace_ids: list[str], run_id: str) -> None:
+        raise NotImplementedError
