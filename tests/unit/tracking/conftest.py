@@ -1,15 +1,23 @@
+import json
 from collections.abc import Mapping
 from unittest.mock import create_autospec
 from uuid import UUID
 
 import pytest
 from mlflow.entities import LifecycleStage
+from mlflow.entities.assessment import Feedback
+from mlflow.entities.span import Span
+from mlflow.tracing.constant import SpanAttributeKey
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.trace import SpanContext, Status, StatusCode
 
 from mlflow_mongodb.tracking.repositories import (
     ExperimentRepository,
     LoggedModelPage,
     LoggedModelRepository,
     RunRepository,
+    TraceRepository,
 )
 from mlflow_mongodb.tracking.store import MongoDBTrackingStore
 from mlflow_mongodb.tracking.types import (
@@ -17,6 +25,8 @@ from mlflow_mongodb.tracking.types import (
     ExperimentTagRecord,
     LoggedModelRecord,
     RunRecord,
+    SpanRecord,
+    TraceRecord,
 )
 
 FIXED_TIMESTAMP = 1_700_000_000_000
@@ -179,3 +189,108 @@ def logged_model_store(
     logged_model_repository.get_metric_history.return_value = ()
     logged_model_repository.search.return_value = LoggedModelPage((), False)
     return store
+
+
+@pytest.fixture
+def trace_repository():
+    return create_autospec(TraceRepository, instance=True)
+
+
+@pytest.fixture
+def trace_record_factory():
+    def factory(**overrides):
+        document = {
+            "_id": f"tr-{UUID(int=42).hex}",
+            "experiment_id": EXPERIMENT_ID,
+            "request_time": FIXED_TIMESTAMP,
+            "state": "OK",
+            "execution_duration": 10,
+            "tags": [{"k": "team", "v": "risk"}],
+            "trace_metadata": [{"k": "source", "v": "test"}],
+        }
+        assessments = overrides.pop("assessments", ())
+        document.update(overrides)
+        return TraceRecord.from_document(document, assessments=assessments)
+
+    return factory
+
+
+@pytest.fixture
+def trace_store(store, trace_repository, trace_record_factory, experiment_record_factory):
+    store.__dict__["_trace_repository"] = trace_repository
+    store._experiment_repository.find_by_id.return_value = experiment_record_factory()
+    trace_repository.start_trace.return_value = trace_record_factory()
+    trace_repository.get_trace_info.return_value = trace_record_factory()
+    trace_repository.batch_get_trace_infos.return_value = []
+    trace_repository.batch_get_traces.return_value = []
+    trace_repository.search_trace_infos.return_value = []
+    trace_repository.get_spans.return_value = []
+    trace_repository.query_trace_metrics.return_value = []
+    return store
+
+
+@pytest.fixture
+def feedback_factory(trace_record_factory):
+    def factory(**overrides):
+        assessment_id = overrides.pop("assessment_id", "a-original")
+        arguments = {
+            "name": "quality",
+            "value": True,
+            "trace_id": trace_record_factory().trace_id,
+            "span_id": "0000000000000001",
+            "metadata": {"reviewer": "alice"},
+            "create_time_ms": FIXED_TIMESTAMP - 1000,
+            "last_update_time_ms": FIXED_TIMESTAMP - 500,
+        }
+        arguments.update(overrides)
+        assessment = Feedback(**arguments)
+        assessment.assessment_id = assessment_id
+        return assessment
+
+    return factory
+
+
+@pytest.fixture
+def span_factory(trace_record_factory):
+    def factory(
+        *,
+        span_id=1,
+        parent_id=None,
+        trace_id=None,
+        start_time=1_000_000,
+        end_time=11_000_000,
+        status=StatusCode.OK,
+        attributes=None,
+        resource_attributes=None,
+    ):
+        trace_id = trace_id or trace_record_factory().trace_id
+        values = {SpanAttributeKey.REQUEST_ID: trace_id, SpanAttributeKey.SPAN_TYPE: "CHAIN"}
+        values.update(attributes or {})
+        return Span(
+            ReadableSpan(
+                name=f"span-{span_id}",
+                context=SpanContext(trace_id=42, span_id=span_id, is_remote=False),
+                parent=(
+                    SpanContext(trace_id=42, span_id=parent_id, is_remote=False)
+                    if parent_id is not None
+                    else None
+                ),
+                start_time=start_time,
+                end_time=end_time,
+                status=Status(status),
+                attributes={key: json.dumps(value) for key, value in values.items()},
+                resource=Resource(resource_attributes or {}),
+            )
+        )
+
+    return factory
+
+
+@pytest.fixture
+def span_record_factory(span_factory):
+    def factory(**kwargs):
+        return SpanRecord.from_document(
+            MongoDBTrackingStore._span_to_document(span_factory(**kwargs))
+        )
+
+    return factory
