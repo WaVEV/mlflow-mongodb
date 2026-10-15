@@ -7,7 +7,7 @@ from typing import Literal
 from mlflow.entities import LifecycleStage
 from pymongo import ASCENDING, DESCENDING, ReturnDocument
 from pymongo.database import Database
-from pymongo.errors import DuplicateKeyError, PyMongoError
+from pymongo.errors import DuplicateKeyError
 
 from mlflow_mongodb.infrastructure.errors import (
     RepositoryAlreadyExistsError,
@@ -46,9 +46,8 @@ class ExperimentRepository:
 
     def __init__(self, database: Database, settings: MongoDBSettings | None = None):
         self._settings = settings or MongoDBSettings()
-        with repository_operation("Unable to select collection.", errors=(PyMongoError,)):
-            self._collection = database[self._settings.experiments_collection_name]
         with repository_operation("Unable to initialize repository."):
+            self._collection = database[self._settings.experiments_collection_name]
             self._collection.create_index(
                 [("name", ASCENDING)], unique=True, name=self.UNIQUE_NAME_INDEX
             )
