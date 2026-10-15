@@ -140,14 +140,14 @@ class RunRepository:
             match = {
                 "tags": {
                     "$elemMatch": {
-                        "key": MLFLOW_DATASET_CONTEXT,
-                        "value": build_value_condition(comparator, value),
+                        "k": MLFLOW_DATASET_CONTEXT,
+                        "v": build_value_condition(comparator, value),
                     }
                 }
             }
             if comparator in ("!=", "NOT IN"):
                 match["tags"]["$elemMatch"] = {
-                    "$and": [match["tags"]["$elemMatch"], {"value": {"$ne": None}}]
+                    "$and": [match["tags"]["$elemMatch"], {"v": {"$ne": None}}]
                 }
         else:
             field = f"dataset.{key}"
