@@ -1490,6 +1490,161 @@ class MongoDBTrackingStore(AbstractStore):
             ) from None
 
     @staticmethod
+    def _validate_linked_prompt_filter(clause: SearchFilterClause) -> None:
+        if (
+            clause.field_type == "tag"
+            and clause.key == TraceTagKey.LINKED_PROMPTS
+            and (clause.comparator != "=" or clause.value.count("/") != 1)
+        ):
+            raise RepositoryInvalidPromptFilterError("Invalid linked-prompt comparison.")
+
+    @staticmethod
+    def _validate_reserved_metadata_filter(clause: SearchFilterClause) -> None:
+        allowed = ("=", "!=", "IS NULL", "IS NOT NULL")
+        if (
+            clause.field_type == "request_metadata"
+            and clause.key in (TraceMetadataKey.TOKEN_USAGE, TraceMetadataKey.COST)
+            and clause.comparator not in allowed
+        ):
+            raise RepositoryUnsupportedComparatorError(
+                clause.field_type, clause.key, clause.comparator, allowed, field_specific=True
+            )
+
+    @cached_property
+    def _trace_filter_validator(self) -> SearchFilterValidator:
+        return ConfiguredSearchFilterValidator(
+            rules=(self._validate_linked_prompt_filter, self._validate_reserved_metadata_filter),
+            field_types=("attribute", "tag", "request_metadata"),
+            # MLflow resolves aliases before validation (name/prompt/run_id become tags/metadata).
+            attribute_keys=SearchTraceUtils.VALID_SEARCH_ATTRIBUTE_KEYS,
+            comparators={
+                "attribute": SearchTraceUtils.VALID_STRING_ATTRIBUTE_COMPARATORS,
+                "tag": SearchTraceUtils.VALID_TAG_COMPARATORS,
+                "request_metadata": SearchTraceUtils.VALID_METADATA_COMPARATORS,
+            },
+            field_comparators={
+                ("attribute", key): SearchTraceUtils.VALID_NUMERIC_ATTRIBUTE_COMPARATORS
+                for key in SearchTraceUtils.NUMERIC_ATTRIBUTES
+            },
+            regex_comparators=("RLIKE",),
+        )
+
+    def _parse_trace_filters(self, filter_string: str | None) -> list[TraceSearchFilter]:
+        filters = []
+        for parsed in SearchTraceUtils.parse_search_filter_for_search_traces(filter_string):
+            # TODO: Apply span and assessment filters before pagination, preserving same-span
+            # matching, direct/session-scoped assessments, and unique trace results.
+            if parsed["type"] in ("span", "feedback", "expectation", "issue"):
+                continue
+            try:
+                clause = self._trace_filter_validator.validate(parsed)
+            except RepositoryUnsupportedFieldTypeError as exc:
+                logger.error("Unable to validate trace filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid trace search field type: {exc.field_type}"
+                ) from None
+            except RepositoryInvalidAttributeError as exc:
+                logger.error("Unable to validate trace filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid trace search attribute: {exc.key}"
+                ) from None
+            except RepositoryUnsupportedComparatorError as exc:
+                logger.error("Unable to validate trace filter: %s", exc)
+                if exc.field_specific and exc.field_type == "request_metadata":
+                    message = (
+                        f"Comparator '{exc.comparator}' is not supported for reserved metadata "
+                        f"'{exc.key}'. Only '=', '!=', 'IS NULL', and 'IS NOT NULL' are supported."
+                    )
+                else:
+                    message = (
+                        f"Invalid comparator '{exc.comparator}' for trace {exc.field_type} "
+                        f"'{exc.key}'. Supported comparators: {exc.allowed}."
+                    )
+                raise MlflowException.invalid_parameter_value(message) from None
+            except RepositoryInvalidPromptFilterError as exc:
+                logger.error("Unable to validate trace prompt filter: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    'Prompt filters require `prompt = "name/version"`.'
+                ) from None
+            except RepositoryInvalidRegexError as exc:
+                logger.error("Unable to parse trace filter regular expression: %s", exc)
+                raise MlflowException.invalid_parameter_value(
+                    "Invalid regular expression in trace filter."
+                ) from None
+            filters.append(
+                TraceSearchFilter(clause.field_type, clause.key, clause.comparator, clause.value)
+            )
+        return filters
+
+    @handle_persistence_error("Unable to search traces.", logger=logger)
+    def search_traces(
+        self,
+        experiment_ids: list[str] | None = None,
+        filter_string: str | None = None,
+        max_results: int = SEARCH_TRACES_DEFAULT_MAX_RESULTS,
+        order_by: list[str] | None = None,
+        page_token: str | None = None,
+        model_id: str | None = None,  # ruff: ignore[unused-method-argument]
+        locations: list[str] | None = None,
+    ) -> tuple[list[TraceInfo], str | None]:
+        locations = _resolve_experiment_ids_and_locations(experiment_ids, locations)
+        if (
+            isinstance(max_results, bool)
+            or not isinstance(max_results, int)
+            or max_results < 1
+            or max_results > SEARCH_MAX_RESULTS_THRESHOLD
+        ):
+            raise MlflowException(
+                f"Invalid value {max_results} for parameter 'max_results' supplied. It must be "
+                f"a positive integer at most {SEARCH_MAX_RESULTS_THRESHOLD}",
+                INVALID_PARAMETER_VALUE,
+            )
+        filters = self._parse_trace_filters(filter_string)
+
+        orders = []
+        seen_order_fields = set()
+        for clause in order_by or []:
+            field_type, key, ascending = SearchTraceUtils.parse_order_by_for_search_traces(clause)
+            if field_type == "attribute":
+                SearchTraceUtils.is_attribute(field_type, key, "=")
+            elif field_type == "tag":
+                SearchTraceUtils.is_tag(field_type, "=")
+            elif field_type == "request_metadata":
+                SearchTraceUtils.is_request_metadata(field_type, "=")
+            else:
+                raise MlflowException.invalid_parameter_value(
+                    f"Invalid trace ordering field: {field_type}"
+                )
+            if field_type == "request_metadata" and key in (
+                TraceMetadataKey.TOKEN_USAGE,
+                TraceMetadataKey.COST,
+            ):
+                raise MlflowException.invalid_parameter_value(
+                    f"Ordering by reserved metadata '{key}' is not supported."
+                )
+            if (field_type, key) in seen_order_fields:
+                raise MlflowException.invalid_parameter_value(
+                    f"`order_by` contains duplicate fields: {order_by}"
+                )
+            seen_order_fields.add((field_type, key))
+            orders.append(TraceSearchOrder(field_type, key, ascending))
+        offset = SearchTraceUtils.parse_start_offset_from_page_token(page_token)
+        if offset < 0:
+            raise MlflowException("Page offset must not be negative.", INVALID_PARAMETER_VALUE)
+        records = self._trace_repository.search_trace_infos(
+            experiment_ids=locations,
+            filters=filters,
+            order_by=orders,
+            offset=offset,
+            limit=max_results,
+        )
+
+        next_token = None
+        if len(records) == max_results:
+            next_token = SearchTraceUtils.create_page_token(offset + max_results)
+        return [self._to_trace_info(record) for record in records], next_token
+
+    @staticmethod
     def _assessment_to_document(assessment: Assessment) -> dict[str, Any]:
         document = assessment.to_dictionary()
         if assessment.expectation is not None:
@@ -1626,6 +1781,57 @@ class MongoDBTrackingStore(AbstractStore):
     def delete_assessment(self, trace_id: str, assessment_id: str) -> None:
         self._get_trace_record(trace_id)
         self._trace_repository.delete_assessment(trace_id=trace_id, assessment_id=assessment_id)
+
+    @handle_persistence_error("Unable to query trace metrics.", logger=logger)
+    def query_trace_metrics(
+        self,
+        experiment_ids: list[str],
+        view_type: MetricViewType,
+        metric_name: str,
+        aggregations: list[MetricAggregation],
+        dimensions: list[str] | None = None,
+        filters: list[str] | None = None,
+        time_interval_seconds: int | None = None,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        max_results: int = MAX_RESULTS_QUERY_TRACE_METRICS,
+        page_token: str | None = None,  # ruff: ignore[unused-method-argument]
+    ) -> PagedList[MetricDataPoint]:
+        # Its SQL models import MLflow clients, which are unavailable during discovery.
+        from mlflow.store.tracking.utils.sql_trace_metrics_utils import (  # ruff: ignore[import-outside-top-level]
+            validate_query_trace_metrics_params,
+        )
+
+        validate_query_trace_metrics_params(view_type, metric_name, aggregations, dimensions)
+        if time_interval_seconds and (start_time_ms is None or end_time_ms is None):
+            raise MlflowException.invalid_parameter_value(
+                "start_time_ms and end_time_ms are required if time_interval_seconds is set"
+            )
+
+        try:
+            points = self._trace_repository.query_trace_metrics(
+                experiment_ids=experiment_ids,
+                view_type=view_type,
+                metric_name=metric_name,
+                aggregations=aggregations,
+                dimensions=dimensions,
+                filters=filters,
+                time_interval_seconds=time_interval_seconds,
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+                max_results=max_results,
+            )
+        except RepositoryUnsupportedFieldTypeError as exc:
+            logger.error("Unable to validate trace metric filter: %s", exc)
+            required_view = {
+                "span": MetricViewType.SPANS,
+                "assessment": MetricViewType.ASSESSMENTS,
+            }[exc.field_type]
+            raise MlflowException.invalid_parameter_value(
+                f"Filtering by {exc.field_type} is only supported for {required_view} view "
+                f"type, got {view_type}"
+            ) from None
+        return PagedList(points, None)
 
     # Logged models
 
