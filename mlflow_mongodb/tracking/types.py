@@ -196,9 +196,7 @@ class DatasetInputRecord:
             source=dataset["source"],
             schema=dataset.get("schema"),
             profile=dataset.get("profile"),
-            tags=tuple(
-                ExperimentTagRecord(tag["key"], tag["value"]) for tag in document.get("tags", [])
-            ),
+            tags=tuple(ExperimentTagRecord(tag["k"], tag["v"]) for tag in document.get("tags", [])),
         )
 
 

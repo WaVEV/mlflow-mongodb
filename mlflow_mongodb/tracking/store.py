@@ -881,7 +881,7 @@ class MongoDBTrackingStore(AbstractStore):
         dataset_inputs = [
             {
                 "dataset": dataset_input.dataset.to_dictionary(),
-                "tags": [{"key": tag.key, "value": tag.value} for tag in dataset_input.tags],
+                "tags": [{"k": tag.key, "v": tag.value} for tag in dataset_input.tags],
             }
             for dataset_input in datasets or []
         ]

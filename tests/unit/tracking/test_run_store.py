@@ -146,7 +146,7 @@ def test_get_run_converts_params_metrics_inputs_outputs_and_tags(
                         "schema": "{}",
                         "profile": "{}",
                     },
-                    "tags": [{"key": "context", "value": "training"}],
+                    "tags": [{"k": "context", "v": "training"}],
                 }
             ],
             "models": [{"model_id": "m-model"}],
@@ -240,7 +240,7 @@ def test_inputs_outputs_are_encoded_without_losing_dataset_metadata(run_store, r
     run_repository.log_inputs.assert_called_once_with(
         run_id=RUN_ID,
         datasets=[
-            {"dataset": dataset.to_dictionary(), "tags": [{"key": "context", "value": "training"}]}
+            {"dataset": dataset.to_dictionary(), "tags": [{"k": "context", "v": "training"}]}
         ],
         models=[{"model_id": "m-input"}],
     )
