@@ -32,9 +32,9 @@ from mlflow_mongodb.infrastructure.errors import (
     RepositoryAlreadyExistsError,
     RepositoryNotActiveError,
     RepositoryNotFoundError,
+    RepositoryParamConflictError,
     RepositoryPersistenceError,
 )
-from mlflow_mongodb.tracking.errors import RepositoryParamConflictError
 from mlflow_mongodb.tracking.store import MongoDBTrackingStore
 from mlflow_mongodb.tracking.types import RunMetricRecord
 

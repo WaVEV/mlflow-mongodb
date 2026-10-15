@@ -80,6 +80,7 @@ from mlflow_mongodb.infrastructure.errors import (
     RepositoryInvalidFilterValueError,
     RepositoryNotActiveError,
     RepositoryNotFoundError,
+    RepositoryParamConflictError,
     RepositoryTagNotFoundError,
     RepositoryUnsupportedComparatorError,
     RepositoryUnsupportedFieldTypeError,
@@ -91,7 +92,6 @@ from mlflow_mongodb.infrastructure.search_filters import (
 )
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
 from mlflow_mongodb.infrastructure.store_errors import handle_persistence_error
-from mlflow_mongodb.tracking.errors import RepositoryParamConflictError
 from mlflow_mongodb.tracking.repositories import (
     ExperimentRepository,
     LoggedModelRepository,
