@@ -9,8 +9,8 @@ from mlflow.protos.databricks_pb2 import (
 )
 from mlflow.utils import validation as mlflow_validation
 
-from mlflow_mongodb import MongoDBModelRegistryStore
 from mlflow_mongodb.infrastructure.errors import RepositoryNotFoundError
+from mlflow_mongodb.model_registry.store import MongoDBModelRegistryStore
 
 MODEL_NAME = "mongodb-functional-alias-model"
 SUPPORTS_LATEST_ALIAS_LOOKUP = hasattr(

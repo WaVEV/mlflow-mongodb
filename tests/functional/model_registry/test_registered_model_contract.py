@@ -10,8 +10,8 @@ from mlflow.protos.databricks_pb2 import (
     ErrorCode,
 )
 
-from mlflow_mongodb import MongoDBModelRegistryStore
 from mlflow_mongodb.infrastructure.errors import RepositoryNotFoundError
+from mlflow_mongodb.model_registry.store import MongoDBModelRegistryStore
 
 
 def _latest_versions_by_stage(versions):
