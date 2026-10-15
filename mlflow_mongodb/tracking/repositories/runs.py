@@ -14,11 +14,11 @@ from mlflow_mongodb.infrastructure.errors import (
     RepositoryAlreadyExistsError,
     RepositoryNotActiveError,
     RepositoryNotFoundError,
+    RepositoryParamConflictError,
 )
 from mlflow_mongodb.infrastructure.repository_operations import repository_operation
 from mlflow_mongodb.infrastructure.search_filters import build_value_condition
 from mlflow_mongodb.infrastructure.settings import MongoDBSettings
-from mlflow_mongodb.tracking.errors import RepositoryParamConflictError
 from mlflow_mongodb.tracking.types import RunMetricRecord, RunRecord
 
 
