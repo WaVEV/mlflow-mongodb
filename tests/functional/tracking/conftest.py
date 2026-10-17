@@ -1,7 +1,9 @@
 import os
 from collections.abc import Iterator
+from uuid import uuid4
 
 import pytest
+from mlflow.entities import TraceInfo, TraceLocation, TraceState
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
@@ -16,6 +18,9 @@ def _clear_application_collections(store: MongoDBTrackingStore) -> None:
     store._database[store._settings.runs_collection_name].delete_many({})
     store._database[store._settings.run_metrics_collection_name].delete_many({})
     store._database[store._settings.logged_models_collection_name].delete_many({})
+    store._database[store._settings.traces_collection_name].delete_many({})
+    store._database[store._settings.spans_collection_name].delete_many({})
+    store._database[store._settings.assessments_collection_name].delete_many({})
 
 
 @pytest.fixture(scope="session")
@@ -59,6 +64,7 @@ def mongodb_store(mongodb_uri: str) -> Iterator[MongoDBTrackingStore]:
     store._experiment_repository
     store._run_repository
     store._logged_model_repository
+    store._trace_repository
 
     try:
         yield store
@@ -99,3 +105,28 @@ def clock(monkeypatch):
         "mlflow_mongodb.tracking.store.get_current_time_millis", lambda: current["now"]
     )
     return current
+
+
+@pytest.fixture
+def trace_info_factory(store):
+    experiment_id = store.create_experiment("trace-experiment")
+
+    def factory(**overrides):
+        arguments = {
+            "trace_id": f"tr-{uuid4().hex}",
+            "trace_location": TraceLocation.from_experiment_id(experiment_id),
+            "request_time": 1_700_000_000_000,
+            "state": TraceState.OK,
+            "execution_duration": 10,
+        }
+        arguments.update(overrides)
+        return TraceInfo(**arguments)
+
+    return factory
+
+
+@pytest.fixture
+def trace(store, trace_info_factory):
+    return store.start_trace(trace_info_factory())
+
+

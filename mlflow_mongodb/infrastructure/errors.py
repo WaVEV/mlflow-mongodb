@@ -82,3 +82,7 @@ class RepositoryTagNotFoundError(Exception):
     """Raised when a requested tag is missing from an existing resource."""
 
 
+class RepositoryWriteConflictError(Exception):
+    """Raised when a concurrent write invalidates the state required for an update."""
+
+
