@@ -38,7 +38,7 @@ from mlflow.entities import (
     TraceState,
     ViewType,
 )
-from mlflow.entities.assessment import ExpectationValue, FeedbackValue
+from mlflow.entities.assessment import Expectation, ExpectationValue, Feedback, FeedbackValue
 from mlflow.entities.logged_model_parameter import LoggedModelParameter
 from mlflow.entities.logged_model_status import LoggedModelStatus
 from mlflow.entities.logged_model_tag import LoggedModelTag
@@ -1131,7 +1131,7 @@ class MongoDBTrackingStore(AbstractStore):
             experiment_id=experiment_id,
             max_timestamp_millis=max_timestamp_millis,
             max_traces=max_traces,
-            trace_ids=trace_ids,
+            trace_ids=list(trace_ids) if trace_ids is not None else None,
         )
 
     @handle_persistence_error("Unable to read trace metadata.", logger=logger)
@@ -1758,8 +1758,8 @@ class MongoDBTrackingStore(AbstractStore):
         trace_id: str,
         assessment_id: str,
         name: str | None = None,
-        expectation: ExpectationValue | None = None,
-        feedback: FeedbackValue | None = None,
+        expectation: ExpectationValue | Expectation | None = None,
+        feedback: FeedbackValue | Feedback | None = None,
         rationale: str | None = None,
         metadata: dict[str, str] | None = None,
     ) -> Assessment:
@@ -1776,6 +1776,11 @@ class MongoDBTrackingStore(AbstractStore):
             raise MlflowException.invalid_parameter_value(
                 "Cannot update feedback value on an Expectation assessment."
             )
+        # HTTP handlers may pass complete entities instead of their value objects.
+        if isinstance(expectation, Expectation):
+            expectation = expectation.expectation
+        if isinstance(feedback, Feedback):
+            feedback = feedback.feedback
         if expectation is not None and not isinstance(expectation, ExpectationValue):
             raise MlflowException.invalid_parameter_value(
                 "expectation must be an ExpectationValue."
@@ -2442,7 +2447,7 @@ class MongoDBTrackingStore(AbstractStore):
                 f"Provided {len(trace_ids)} traces."
             )
 
-        self._trace_repository.link_traces_to_run(trace_ids=trace_ids, run_id=run_id)
+        self._trace_repository.link_traces_to_run(trace_ids=list(trace_ids), run_id=run_id)
 
     def unlink_traces_from_run(self, trace_ids: list[str], run_id: str) -> None:
         raise NotImplementedError

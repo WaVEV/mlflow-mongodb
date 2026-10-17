@@ -33,6 +33,7 @@ from mlflow.utils.search_utils import SearchTraceMetricsUtils
 from pymongo import ASCENDING, DESCENDING, ReplaceOne, ReturnDocument, UpdateOne
 from pymongo.database import Database
 from pymongo.errors import (
+    BulkWriteError,
     DuplicateKeyError,
     PyMongoError,
 )
@@ -236,9 +237,10 @@ class TraceRepository:
                 raise RepositoryWriteConflictError(trace_id) from exc
 
     def ensure_traces(self, *, experiment_id: str, request_times: Mapping[str, int]) -> None:
-        """Create missing trace placeholders through a single bulk write.
+        """Create missing trace placeholders, retrying concurrent identity conflicts.
 
         Existing traces retain their metadata. Unordered writes can partially succeed.
+        Retry only failed _id upserts, with at most three bulk-write attempts.
         """
         if not request_times:
             return
@@ -250,8 +252,29 @@ class TraceRepository:
             )
             for trace_id in request_times
         ]
-        with repository_operation("Unable to create trace placeholders."):
-            self._collection.bulk_write(operations, ordered=False)
+        for attempt in range(3):
+            with repository_operation("Unable to create trace placeholders."):
+                try:
+                    self._collection.bulk_write(operations, ordered=False)
+                except BulkWriteError as exc:
+                    write_errors = exc.details.get("writeErrors", [])
+                    if (
+                        attempt == 2
+                        or exc.details.get("writeConcernErrors")
+                        or not write_errors
+                        or any(
+                            error.get("code") != 11000
+                            or error.get("keyPattern") != {"_id": 1}
+                            for error in write_errors
+                        )
+                    ):
+                        raise
+                    failed_indexes = [error["index"] for error in write_errors]
+                else:
+                    return
+            # Successful unordered writes must not be replayed; error indexes refer
+            # to the operations submitted in this attempt, not the original batch.
+            operations = [operations[index] for index in failed_indexes]
 
     @staticmethod
     def _trace_placeholder(request_time: int) -> dict[str, Any]:
