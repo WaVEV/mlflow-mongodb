@@ -1,6 +1,7 @@
 """Shared infrastructure failures translated at the store boundary."""
 
 from collections.abc import Collection
+from typing import Literal
 
 
 class RepositoryAlreadyExistsError(Exception):
@@ -57,6 +58,10 @@ class RepositoryUnsupportedComparatorError(Exception):
 
 class RepositoryInvalidRegexError(Exception):
     """Raised when a filter contains an invalid regular expression."""
+
+
+class RepositoryParamConflictError(Exception):
+    """Raised when an operation attempts to change an existing parameter value."""
 
 
 class RepositoryTagNotFoundError(Exception):
