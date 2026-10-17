@@ -61,3 +61,5 @@ class RepositoryInvalidRegexError(Exception):
 
 class RepositoryTagNotFoundError(Exception):
     """Raised when a requested tag is missing from an existing resource."""
+
+
