@@ -60,6 +60,20 @@ class RepositoryInvalidRegexError(Exception):
     """Raised when a filter contains an invalid regular expression."""
 
 
+class RepositoryEmptySearchKeyError(Exception):
+    """Raised when a filter has an empty key."""
+
+
+class RepositoryInvalidFilterValueError(Exception):
+    """Raised when a filter value does not have its required type or range."""
+
+    def __init__(
+        self, expected: Literal["finite numbers", "a list of string values", "string values"]
+    ):
+        self.expected = expected
+        super().__init__(f"Search filter requires {expected}")
+
+
 class RepositoryParamConflictError(Exception):
     """Raised when an operation attempts to change an existing parameter value."""
 
