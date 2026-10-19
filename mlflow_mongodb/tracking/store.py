@@ -15,6 +15,7 @@ from mlflow.protos.databricks_pb2 import (
 from mlflow.store.entities.paged_list import PagedList
 from mlflow.store.tracking import SEARCH_MAX_RESULTS_DEFAULT, SEARCH_MAX_RESULTS_THRESHOLD
 from mlflow.store.tracking.abstract_store import AbstractStore
+from mlflow.tracking.default_experiment import DEFAULT_EXPERIMENT_ID
 from mlflow.utils.search_utils import SearchExperimentsUtils, SearchUtils
 from mlflow.utils.time import get_current_time_millis
 from mlflow.utils.uri import append_to_uri_path, resolve_uri_if_local
@@ -86,7 +87,16 @@ class MongoDBTrackingStore(AbstractStore):
     @cached_property
     @handle_persistence_error("Unable to initialize experiment repository.", logger=logger)
     def _experiment_repository(self) -> ExperimentRepository:
-        return ExperimentRepository(self._database, settings=self._settings)
+        repository = ExperimentRepository(self._database, settings=self._settings)
+        artifact_location = resolve_uri_if_local(
+            append_to_uri_path(self.artifact_uri or "./mlruns", DEFAULT_EXPERIMENT_ID)
+        )
+        _validate_experiment_artifact_location_length(artifact_location)
+        repository.ensure_default_experiment(
+            artifact_location=artifact_location,
+            creation_timestamp=get_current_time_millis(),
+        )
+        return repository
 
     @handle_persistence_error("A database operation failed.", logger=logger)
     def search_experiments(
@@ -222,7 +232,7 @@ class MongoDBTrackingStore(AbstractStore):
             tags_by_key[tag.key] = tag.value
 
         # Decimal UUIDs preserve numeric experiment IDs used by prompt filters,
-        # without requiring a shared counter or reserving the default ID "0".
+        # without requiring a shared counter; "0" belongs to the default experiment.
         experiment_id = str(uuid4().int)
         artifact_location = resolve_uri_if_local(
             artifact_location or append_to_uri_path(self.artifact_uri or "./mlruns", experiment_id)

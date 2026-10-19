@@ -8,7 +8,7 @@ from mlflow_mongodb.tracking.store import MongoDBTrackingStore
 
 @pytest.fixture
 def search_experiments(store: MongoDBTrackingStore, clock):
-    experiment_ids = {}
+    experiment_ids = {"Default": "0"}
     for timestamp, name, tags in (
         (1000, "RiskA", [ExperimentTag("team", "risk"), ExperimentTag("purpose", "evaluation")]),
         (2000, "RiskB", [ExperimentTag("team", "platform"), ExperimentTag("purpose", "risk")]),
@@ -38,10 +38,10 @@ def test_experiment_repository_rejects_unsupported_comparator(
 @pytest.mark.parametrize(
     ("filter_string", "expected_names"),
     [
-        (None, {"RiskA", "RiskB", "Other"}),
-        ("", {"RiskA", "RiskB", "Other"}),
+        (None, {"Default", "RiskA", "RiskB", "Other"}),
+        ("", {"Default", "RiskA", "RiskB", "Other"}),
         ("name = 'RiskA'", {"RiskA"}),
-        ("name != 'RiskA'", {"RiskB", "Other"}),
+        ("name != 'RiskA'", {"Default", "RiskB", "Other"}),
         ("name LIKE 'Risk%'", {"RiskA", "RiskB"}),
         ("name LIKE 'risk%'", set()),
         ("name ILIKE 'risk%'", {"RiskA", "RiskB"}),
@@ -53,7 +53,7 @@ def test_experiment_repository_rejects_unsupported_comparator(
         ("tags.team = 'risk' AND tags.purpose = 'risk'", set()),
         ("tags.team LIKE 'r%' AND tags.team != 'risk'", set()),
         ("creation_time >= 2000", {"RiskB", "Other"}),
-        ("last_update_time < 2000", {"RiskA"}),
+        ("last_update_time < 2000", {"Default", "RiskA"}),
     ],
 )
 def test_search_experiment_attribute_and_tag_filters(
@@ -89,13 +89,14 @@ def tag_existence_experiments(store: MongoDBTrackingStore):
         {"_id": experiment_ids["null-value"]}, {"$set": {"tags": [{"k": "team", "v": None}]}}
     )
     assert null_value.modified_count == 1
+    experiment_ids["Default"] = "0"
     return experiment_ids
 
 
 @pytest.mark.parametrize(
     ("comparator", "expected_names"),
     [
-        ("IS NULL", {"missing-tags", "empty-tags", "unrelated-tag"}),
+        ("IS NULL", {"Default", "missing-tags", "empty-tags", "unrelated-tag"}),
         ("IS NOT NULL", {"present-tag", "empty-value", "null-value"}),
     ],
 )
@@ -123,7 +124,7 @@ def test_repository_search_tag_existence_filters(
 @pytest.mark.parametrize(
     ("comparator", "expected_names"),
     [
-        ("IS NULL", {"missing-tags", "empty-tags", "unrelated-tag"}),
+        ("IS NULL", {"Default", "missing-tags", "empty-tags", "unrelated-tag"}),
         ("IS NOT NULL", {"present-tag", "empty-value", "null-value"}),
     ],
 )
@@ -141,9 +142,9 @@ def test_search_experiment_tag_existence_filters(
 @pytest.mark.parametrize(
     ("view_type", "expected_names"),
     [
-        (ViewType.ACTIVE_ONLY, {"RiskB", "Other"}),
+        (ViewType.ACTIVE_ONLY, {"Default", "RiskB", "Other"}),
         (ViewType.DELETED_ONLY, {"RiskA"}),
-        (ViewType.ALL, {"RiskA", "RiskB", "Other"}),
+        (ViewType.ALL, {"Default", "RiskA", "RiskB", "Other"}),
     ],
 )
 def test_search_experiment_lifecycle_views(
@@ -159,10 +160,10 @@ def test_search_experiment_lifecycle_views(
 @pytest.mark.parametrize(
     ("order_by", "expected_names"),
     [
-        (None, ["Other", "RiskB", "RiskA"]),
-        (["creation_time ASC"], ["RiskA", "RiskB", "Other"]),
-        (["name DESC"], ["RiskB", "RiskA", "Other"]),
-        (["last_update_time ASC"], ["RiskA", "RiskB", "Other"]),
+        (None, ["Other", "RiskB", "RiskA", "Default"]),
+        (["creation_time ASC"], ["Default", "RiskA", "RiskB", "Other"]),
+        (["name DESC"], ["RiskB", "RiskA", "Other", "Default"]),
+        (["last_update_time ASC"], ["Default", "RiskA", "RiskB", "Other"]),
     ],
 )
 @pytest.mark.usefixtures("search_experiments")
@@ -178,11 +179,11 @@ def test_search_experiments_paginates_timestamp_ties_without_duplicates(
 ):
     clock["now"] = 1000
     experiment_ids = [store.create_experiment(f"experiment-{index}") for index in range(7)]
-    expected_ids = sorted(experiment_ids)
+    expected_ids = [*sorted(experiment_ids), "0"]
     returned_ids = []
     token = None
 
-    for _ in range(len(experiment_ids) + 1):
+    for _ in range(len(expected_ids) + 1):
         page = store.search_experiments(max_results=page_size, page_token=token)
         assert len(page) <= page_size
         returned_ids.extend(experiment.experiment_id for experiment in page)
@@ -193,7 +194,7 @@ def test_search_experiments_paginates_timestamp_ties_without_duplicates(
         pytest.fail("Experiment pagination did not terminate")
 
     assert returned_ids == expected_ids
-    assert len(set(returned_ids)) == len(experiment_ids)
+    assert len(set(returned_ids)) == len(expected_ids)
     assert token is None
 
 

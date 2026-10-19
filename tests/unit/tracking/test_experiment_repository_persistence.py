@@ -183,3 +183,58 @@ def test_missing_experiment_is_returned_without_persistence_error(repository, co
     assert repository.find_by_id("missing") is None
 
     collection.find_one.assert_called_once_with({"_id": "missing"})
+
+
+def test_default_experiment_uses_insert_only_upsert(repository, collection):
+    repository.ensure_default_experiment(
+        artifact_location="s3://artifacts/0", creation_timestamp=1000
+    )
+
+    collection.update_one.assert_called_once_with(
+        {"_id": "0"},
+        {
+            "$setOnInsert": {
+                "name": "Default",
+                "artifact_location": "s3://artifacts/0",
+                "lifecycle_stage": "active",
+                "creation_time": 1000,
+                "last_update_time": 1000,
+                "tags": [],
+            }
+        },
+        upsert=True,
+    )
+
+
+@pytest.mark.parametrize("existing_default", [None, {"_id": "0"}])
+def test_default_experiment_duplicate_only_succeeds_if_default_exists(
+    repository, collection, existing_default
+):
+    duplicate = DuplicateKeyError("Private duplicate details")
+    collection.update_one.side_effect = duplicate
+    collection.find_one.return_value = existing_default
+
+    if existing_default is None:
+        with pytest.raises(RepositoryPersistenceError) as caught:
+            repository.ensure_default_experiment(
+                artifact_location="s3://artifacts/0", creation_timestamp=1000
+            )
+        assert caught.value.__cause__ is duplicate
+    else:
+        repository.ensure_default_experiment(
+            artifact_location="s3://artifacts/0", creation_timestamp=1000
+        )
+
+    collection.find_one.assert_called_once_with({"_id": "0"})
+
+
+def test_default_experiment_translates_database_failure(repository, collection):
+    backend_error = OperationFailure("Private initialization details")
+    collection.update_one.side_effect = backend_error
+
+    with pytest.raises(RepositoryPersistenceError) as caught:
+        repository.ensure_default_experiment(
+            artifact_location="s3://artifacts/0", creation_timestamp=1000
+        )
+
+    assert caught.value.__cause__ is backend_error

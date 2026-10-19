@@ -4,7 +4,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from mlflow.entities import LifecycleStage
+from mlflow.entities import Experiment, LifecycleStage
+from mlflow.tracking.default_experiment import DEFAULT_EXPERIMENT_ID
 from pymongo import ASCENDING, DESCENDING, ReturnDocument
 from pymongo.database import Database
 from pymongo.errors import DuplicateKeyError
@@ -57,6 +58,30 @@ class ExperimentRepository:
                 [("lifecycle_stage", ASCENDING), ("creation_time", DESCENDING), ("_id", ASCENDING)],
                 name="experiments_lifecycle_creation_id",
             )
+
+    def ensure_default_experiment(self, *, artifact_location: str, creation_timestamp: int) -> None:
+        """Create experiment 0 once, preserving existing metadata and lifecycle state."""
+        with repository_operation("Unable to initialize default experiment."):
+            try:
+                self._collection.update_one(
+                    {"_id": DEFAULT_EXPERIMENT_ID},
+                    {
+                        "$setOnInsert": {
+                            "name": Experiment.DEFAULT_EXPERIMENT_NAME,
+                            "artifact_location": artifact_location,
+                            "lifecycle_stage": LifecycleStage.ACTIVE,
+                            "creation_time": creation_timestamp,
+                            "last_update_time": creation_timestamp,
+                            "tags": [],
+                        }
+                    },
+                    upsert=True,
+                )
+            except DuplicateKeyError:
+                # Another store may have inserted experiment 0 concurrently. A name
+                # collision with a different ID is still an initialization failure.
+                if self._collection.find_one({"_id": DEFAULT_EXPERIMENT_ID}) is None:
+                    raise
 
     def search(
         self,

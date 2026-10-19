@@ -25,7 +25,7 @@ def test_experiment_lifecycle_through_mlflow_client(store: MongoDBTrackingStore)
 
     client.delete_experiment(experiment_id)
     assert client.get_experiment(experiment_id).lifecycle_stage == "deleted"
-    assert client.search_experiments() == []
+    assert [experiment.experiment_id for experiment in client.search_experiments()] == ["0"]
     assert [
         experiment.experiment_id
         for experiment in client.search_experiments(view_type=ViewType.DELETED_ONLY)
@@ -34,7 +34,8 @@ def test_experiment_lifecycle_through_mlflow_client(store: MongoDBTrackingStore)
     client.restore_experiment(experiment_id)
     assert client.get_experiment(experiment_id).lifecycle_stage == "active"
     assert [experiment.experiment_id for experiment in client.search_experiments()] == [
-        experiment_id
+        experiment_id,
+        "0",
     ]
 
 

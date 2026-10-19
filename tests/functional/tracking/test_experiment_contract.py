@@ -85,7 +85,7 @@ def test_experiment_name_remains_unique_across_lifecycle_stages(
 
     assert caught.value.error_code == ErrorCode.Name(RESOURCE_ALREADY_EXISTS)
     assert store.get_experiment_by_name("experiment-unique").experiment_id == experiment_id
-    assert len(store.search_experiments(view_type=ViewType.ALL)) == 1
+    assert len(store.search_experiments(view_type=ViewType.ALL)) == 2
 
 
 def test_delete_and_restore_preserve_experiment_metadata(store: MongoDBTrackingStore, clock):
@@ -104,7 +104,7 @@ def test_delete_and_restore_preserve_experiment_metadata(store: MongoDBTrackingS
     assert deleted.tags == created.tags
     assert deleted.artifact_location == created.artifact_location
     assert store.get_experiment_by_name(created.name).lifecycle_stage == LifecycleStage.DELETED
-    assert store.search_experiments() == []
+    assert [experiment.experiment_id for experiment in store.search_experiments()] == ["0"]
     deleted_experiments = store.search_experiments(ViewType.DELETED_ONLY)
     assert [experiment.experiment_id for experiment in deleted_experiments] == [experiment_id]
 
@@ -123,7 +123,8 @@ def test_delete_and_restore_preserve_experiment_metadata(store: MongoDBTrackingS
     assert restored.artifact_location == created.artifact_location
     assert store.search_experiments(ViewType.DELETED_ONLY) == []
     assert [experiment.experiment_id for experiment in store.search_experiments()] == [
-        experiment_id
+        experiment_id,
+        "0",
     ]
 
     with pytest.raises(MlflowException) as repeated_restore:
@@ -206,4 +207,6 @@ def test_invalid_experiment_name_is_rejected(store: MongoDBTrackingStore, name):
         store.create_experiment(name)
 
     assert caught.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
-    assert store.search_experiments(view_type=ViewType.ALL) == []
+    assert [
+        experiment.experiment_id for experiment in store.search_experiments(view_type=ViewType.ALL)
+    ] == ["0"]

@@ -1,11 +1,16 @@
+from __future__ import annotations
+
 import os
 from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import pytest
+from mlflow.tracking._tracking_service.utils import _get_store  # ruff: ignore[import-private-name]
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-from mlflow_mongodb.tracking.store import MongoDBTrackingStore
+if TYPE_CHECKING:
+    from mlflow_mongodb.tracking.store import MongoDBTrackingStore
 
 MONGODB_URI_ENV_VAR = "MONGODB_URI"
 SERVER_SELECTION_TIMEOUT_MS = 3_000
@@ -26,7 +31,7 @@ def mongodb_uri() -> str:
 @pytest.fixture(scope="session")
 def mongodb_store(mongodb_uri: str) -> Iterator[MongoDBTrackingStore]:
     client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=SERVER_SELECTION_TIMEOUT_MS)
-    store = MongoDBTrackingStore(store_uri=mongodb_uri, artifact_uri="s3://experiment-artifacts")
+    store = _get_store(store_uri=mongodb_uri, artifact_uri="s3://experiment-artifacts")
     store.__dict__["_mongo_client"] = client
 
     try:
@@ -65,7 +70,13 @@ def mongodb_store(mongodb_uri: str) -> Iterator[MongoDBTrackingStore]:
 
 
 @pytest.fixture
-def store(mongodb_store: MongoDBTrackingStore) -> Iterator[MongoDBTrackingStore]:
+def store(mongodb_store: MongoDBTrackingStore, clock) -> Iterator[MongoDBTrackingStore]:
+    # Reopen the repository after each cleanup, as a client opening a fresh database would.
+    mongodb_store.__dict__.pop("_experiment_repository", None)
+    timestamp = clock["now"]
+    clock["now"] = 0
+    mongodb_store._experiment_repository
+    clock["now"] = timestamp
     try:
         yield mongodb_store
     finally:

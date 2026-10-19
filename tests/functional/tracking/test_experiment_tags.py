@@ -141,7 +141,7 @@ def test_set_tag_on_missing_experiment_does_not_create_document(store, experimen
         store.set_experiment_tag(experiment_id, ExperimentTag("team", "risk"))
 
     assert caught.value.error_code == ErrorCode.Name(RESOURCE_DOES_NOT_EXIST)
-    assert store._database[store._settings.experiments_collection_name].count_documents({}) == 0
+    assert store._database[store._settings.experiments_collection_name].count_documents({}) == 1
 
 
 @pytest.mark.parametrize("experiment_id", [None, "missing", 123456789])
@@ -150,7 +150,7 @@ def test_delete_tag_on_missing_experiment_does_not_create_document(store, experi
         store.delete_experiment_tag(experiment_id, "team")
 
     assert caught.value.error_code == ErrorCode.Name(RESOURCE_DOES_NOT_EXIST)
-    assert store._database[store._settings.experiments_collection_name].count_documents({}) == 0
+    assert store._database[store._settings.experiments_collection_name].count_documents({}) == 1
 
 
 def test_set_tag_on_deleted_experiment_is_rejected_without_mutation(store):
@@ -209,7 +209,7 @@ def test_invalid_tag_validation_precedes_missing_experiment_lookup(store):
         store.set_experiment_tag("missing", ExperimentTag("$invalid", "value"))
 
     assert caught.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
-    assert store._database[store._settings.experiments_collection_name].count_documents({}) == 0
+    assert store._database[store._settings.experiments_collection_name].count_documents({}) == 1
 
 
 def test_experiment_tag_mutations_do_not_affect_other_experiments(store):

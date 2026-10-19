@@ -3,8 +3,10 @@ from unittest.mock import MagicMock, Mock
 import pytest
 from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE, ErrorCode
+from mlflow.utils.uri import resolve_uri_if_local
 from pymongo.errors import ConfigurationError
 
+from mlflow_mongodb.tracking.repositories import ExperimentRepository
 from mlflow_mongodb.tracking.store import MongoDBTrackingStore
 
 
@@ -95,3 +97,22 @@ def test_store_rejects_invalid_configured_experiment_collection(monkeypatch):
 
     with pytest.raises(ValueError, match="Invalid MongoDB collection name"):
         MongoDBTrackingStore("mongodb://localhost:27017/mlflow")
+
+
+@pytest.mark.parametrize("artifact_uri", [None, "s3://artifacts"])
+def test_repository_initializes_default_experiment_once(monkeypatch, artifact_uri):
+    repository = Mock(spec=ExperimentRepository)
+    initialize = Mock(return_value=repository)
+    monkeypatch.setattr("mlflow_mongodb.tracking.store.ExperimentRepository", initialize)
+    monkeypatch.setattr("mlflow_mongodb.tracking.store.get_current_time_millis", lambda: 1000)
+    store = MongoDBTrackingStore("mongodb://localhost:27017/mlflow", artifact_uri=artifact_uri)
+    store.__dict__["_database"] = Mock()
+
+    initialize.assert_not_called()
+    assert store._experiment_repository is repository
+    assert store._experiment_repository is repository
+
+    repository.ensure_default_experiment.assert_called_once_with(
+        artifact_location=resolve_uri_if_local(f"{artifact_uri or './mlruns'}/0"),
+        creation_timestamp=1000,
+    )
