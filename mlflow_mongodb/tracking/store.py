@@ -358,7 +358,7 @@ class MongoDBTrackingStore(AbstractStore):
             logger.error("Unable to set experiment tag: %s", exc)
             raise MlflowException(
                 f"The experiment {experiment_id} must be in the 'active' state. "
-                f"Current state is {exc.args[1]}.",
+                f"Current state is {exc.lifecycle_stage}.",
                 INVALID_PARAMETER_VALUE,
             ) from None
 
@@ -376,7 +376,7 @@ class MongoDBTrackingStore(AbstractStore):
             logger.error("Unable to delete experiment tag: %s", exc)
             raise MlflowException(
                 f"The experiment {experiment_id} must be in the 'active' state. "
-                f"Current state is {exc.args[1]}.",
+                f"Current state is {exc.lifecycle_stage}.",
                 INVALID_PARAMETER_VALUE,
             ) from None
         except RepositoryTagNotFoundError as exc:

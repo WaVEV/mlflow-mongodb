@@ -18,6 +18,7 @@ from mlflow_mongodb.infrastructure.errors import (
     RepositoryAlreadyExistsError,
     RepositoryNotActiveError,
     RepositoryNotFoundError,
+    RepositoryTagNotFoundError,
 )
 
 FIXED_TIMESTAMP = 1_700_000_000_000
@@ -279,4 +280,76 @@ def test_rename_experiment_translates_domain_errors(
         experiment_id=EXPERIMENT_ID,
         new_name="renamed-experiment",
         last_update_time=FIXED_TIMESTAMP,
+    )
+
+
+@pytest.mark.parametrize(
+    ("store_method", "repository_method", "tag", "repository_kwargs"),
+    [
+        (
+            "set_experiment_tag",
+            "set_tag",
+            ExperimentTag("team", "risk"),
+            {"key": "team", "value": "risk"},
+        ),
+        ("delete_experiment_tag", "delete_tag", "team", {"key": "team"}),
+    ],
+)
+@pytest.mark.parametrize(
+    ("repository_error", "expected_code", "message"),
+    [
+        (
+            RepositoryNotFoundError("Private lookup"),
+            RESOURCE_DOES_NOT_EXIST,
+            "No Experiment with id=42 exists",
+        ),
+        (
+            RepositoryNotActiveError("Private lifecycle", LifecycleStage.DELETED),
+            INVALID_PARAMETER_VALUE,
+            "The experiment 42 must be in the 'active' state. Current state is deleted.",
+        ),
+        (
+            RepositoryNotActiveError("Private lifecycle"),
+            INVALID_PARAMETER_VALUE,
+            "The experiment 42 must be in the 'active' state. Current state is None.",
+        ),
+    ],
+)
+def test_experiment_tag_methods_translate_domain_errors(
+    store,
+    experiment_repository,
+    store_method,
+    repository_method,
+    tag,
+    repository_kwargs,
+    repository_error,
+    expected_code,
+    message,
+):
+    repository_call = getattr(experiment_repository, repository_method)
+    repository_call.side_effect = repository_error
+
+    with pytest.raises(MlflowException) as caught:
+        getattr(store, store_method)(EXPERIMENT_ID, tag)
+
+    assert caught.value.message == message
+    assert caught.value.error_code == ErrorCode.Name(expected_code)
+    assert "Private" not in caught.value.message
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__ is True
+    repository_call.assert_called_once_with(experiment_id=EXPERIMENT_ID, **repository_kwargs)
+
+
+def test_delete_experiment_tag_translates_missing_tag(store, experiment_repository):
+    experiment_repository.delete_tag.side_effect = RepositoryTagNotFoundError("Private tag")
+
+    with pytest.raises(MlflowException) as caught:
+        store.delete_experiment_tag(EXPERIMENT_ID, "team")
+
+    assert caught.value.message == "No tag with name: team in experiment with id 42"
+    assert caught.value.error_code == ErrorCode.Name(RESOURCE_DOES_NOT_EXIST)
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__ is True
+    experiment_repository.delete_tag.assert_called_once_with(
+        experiment_id=EXPERIMENT_ID, key="team"
     )
