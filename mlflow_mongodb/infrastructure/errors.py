@@ -11,6 +11,10 @@ class RepositoryAlreadyExistsError(Exception):
 class RepositoryNotFoundError(Exception):
     """Raised when a resource is not stored in the expected lifecycle stage."""
 
+    def __init__(self, resource_id: str | None):
+        super().__init__(resource_id)
+        self.resource_id = resource_id
+
 
 class RepositoryNotActiveError(Exception):
     """Raised when an operation requires an active resource."""
@@ -95,3 +99,7 @@ class RepositoryTagNotFoundError(Exception):
 
 class RepositoryWriteConflictError(Exception):
     """Raised when a concurrent write invalidates the state required for an update."""
+
+    def __init__(self, resource_id: str | None):
+        super().__init__(resource_id)
+        self.resource_id = resource_id
